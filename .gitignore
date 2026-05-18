@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# Data and experiment outputs
+datasets/
+output/
+runs/
+wandb/
+swanlog/
+swanlab/
+
+# Model checkpoints and weights
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+
+# Logs and generated artifacts
+*.log
+*.tmp
+*.cache
+*.csv
+
+# OS files
+.DS_Store
+Thumbs.db
