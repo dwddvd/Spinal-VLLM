@@ -70,6 +70,14 @@ def normalize_label(text: str) -> Optional[str]:
     return None
 
 
+def label_to_zh(label: str) -> str:
+    if label == "infection":
+        return INFECTION_ZH
+    if label == "tumor":
+        return TUMOR_ZH
+    raise ValueError(f"Unknown label: {label}")
+
+
 def infer_sequence(text: str) -> Optional[str]:
     match = re.search(r"\b([Tt][12](?:WI)?)\b", text)
     return match.group(1).upper() if match else None
@@ -164,17 +172,28 @@ def load_records(json_path: str) -> List[LesionRecord]:
     return records
 
 
-def build_prompt(seq: Optional[str]) -> str:
-    seq_text = f" MRI sequence: {seq}." if seq else ""
+def build_prompt(seq: Optional[str], bbox: Optional[Tuple[int, int, int, int]] = None, input_mode: str = "bbox_prompt") -> str:
+    seq_text = f"\u5e8f\u5217\u4e3a{seq}\u3002" if seq else ""
+    if input_mode == "bbox_prompt":
+        if bbox is None:
+            raise ValueError("bbox_prompt mode requires bbox.")
+        x1, y1, x2, y2 = bbox
+        return (
+            f"\u8fd9\u662f\u4e00\u5e45\u810a\u690e\u7684\u78c1\u5171\u632f\u56fe\u50cf\uff0c{seq_text}"
+            f"\u5176\u4e2d\u75c5\u7076\u7684\u4f4d\u7f6e\u6309\u7167[x1,y1,x2,y2]\u7684\u683c\u5f0f\u5728"
+            f"[{x1},{y1},{x2},{y2}]\u3002"
+            f"\u8bf7\u5224\u65ad\u8fd9\u4e2a\u75c5\u7076\u5c5e\u4e8e{INFECTION_ZH}\u8fd8\u662f{TUMOR_ZH}\u3002"
+            f"\u53ea\u8f93\u51fa{INFECTION_ZH}\u6216{TUMOR_ZH}\u3002"
+        )
     return (
-        "You are given a cropped spinal MRI lesion region."
-        f"{seq_text} Classify the lesion as infection or tumor. "
-        "Answer strictly in this format: label:infection/tumor"
+        f"\u8fd9\u662f\u4e00\u5e45\u810a\u690e\u78c1\u5171\u632f\u56fe\u50cf\u4e2d\u7684\u75c5\u7076\u533a\u57df\uff0c{seq_text}"
+        f"\u8bf7\u5224\u65ad\u8fd9\u4e2a\u75c5\u7076\u5c5e\u4e8e{INFECTION_ZH}\u8fd8\u662f{TUMOR_ZH}\u3002"
+        f"\u53ea\u8f93\u51fa{INFECTION_ZH}\u6216{TUMOR_ZH}\u3002"
     )
 
 
 def build_answer(label: str) -> str:
-    return f"label:{label}"
+    return label_to_zh(label)
 
 
 def make_dataset(records: List[LesionRecord]) -> Dataset:
@@ -217,21 +236,32 @@ def balance_records(records: List[LesionRecord], seed: int) -> List[LesionRecord
 
 
 class QwenCropDatasetBuilder:
-    def __init__(self, processor, max_length: int, crop_expand_ratio: float):
+    def __init__(self, processor, max_length: int, crop_expand_ratio: float, input_mode: str, image_resize: int):
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.max_length = max_length
         self.crop_expand_ratio = crop_expand_ratio
+        self.input_mode = input_mode
+        self.image_resize = image_resize
 
     def __call__(self, example: Dict) -> Dict:
-        crop = crop_image(example["image_path"], tuple(example["bbox"]), self.crop_expand_ratio)
-        prompt = build_prompt(example.get("seq"))
+        bbox = tuple(example["bbox"])
+        if self.input_mode == "bbox_prompt":
+            image_content = {"type": "image", "image": example["image_path"]}
+            if self.image_resize > 0:
+                image_content["resized_height"] = self.image_resize
+                image_content["resized_width"] = self.image_resize
+            prompt = build_prompt(example.get("seq"), bbox=bbox, input_mode=self.input_mode)
+        else:
+            crop = crop_image(example["image_path"], bbox, self.crop_expand_ratio)
+            image_content = {"type": "image", "image": crop}
+            prompt = build_prompt(example.get("seq"), bbox=None, input_mode=self.input_mode)
         answer = build_answer(example["label"])
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": crop},
+                    image_content,
                     {"type": "text", "text": prompt},
                 ],
             }
@@ -384,18 +414,51 @@ def generate_text(model, processor, messages: List[Dict], max_new_tokens: int) -
     return text[0].strip()
 
 
-def predict_label(model, processor, image, seq: Optional[str], max_new_tokens: int = 16) -> Tuple[str, Optional[str]]:
-    text = generate_text(model, processor, build_messages(build_prompt(seq), image), max_new_tokens=max_new_tokens)
+def predict_label(
+    model,
+    processor,
+    image,
+    seq: Optional[str],
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    input_mode: str = "crop",
+    max_new_tokens: int = 16,
+) -> Tuple[str, Optional[str]]:
+    text = generate_text(
+        model,
+        processor,
+        build_messages(build_prompt(seq, bbox=bbox, input_mode=input_mode), image),
+        max_new_tokens=max_new_tokens,
+    )
     return text, normalize_label(text)
 
 
-def evaluate_gt(model, processor, records: List[LesionRecord], crop_expand_ratio: float, max_new_tokens: int) -> Dict[str, float]:
+def evaluate_gt(
+    model,
+    processor,
+    records: List[LesionRecord],
+    crop_expand_ratio: float,
+    input_mode: str,
+    max_new_tokens: int,
+) -> Dict[str, float]:
     correct = 0
     total = 0
     confusion = {"infection->infection": 0, "infection->tumor": 0, "tumor->infection": 0, "tumor->tumor": 0, "invalid": 0}
     for record in tqdm(records, desc="Eval Qwen GT crops", ncols=100):
-        crop = crop_image(record.image_path, record.bbox, crop_expand_ratio)
-        _, pred = predict_label(model, processor, crop, record.seq, max_new_tokens=max_new_tokens)
+        if input_mode == "bbox_prompt":
+            image = record.image_path
+            bbox = record.bbox
+        else:
+            image = crop_image(record.image_path, record.bbox, crop_expand_ratio)
+            bbox = None
+        _, pred = predict_label(
+            model,
+            processor,
+            image,
+            record.seq,
+            bbox=bbox,
+            input_mode=input_mode,
+            max_new_tokens=max_new_tokens,
+        )
         total += 1
         correct += int(pred == record.label)
         if pred in {"infection", "tumor"}:
@@ -422,7 +485,7 @@ def train(args: argparse.Namespace) -> None:
     model, processor = load_model_and_processor(args.base_model, args.load_in_4bit, args.gradient_checkpointing)
     model = add_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout)
 
-    builder = QwenCropDatasetBuilder(processor, args.max_length, args.crop_expand_ratio)
+    builder = QwenCropDatasetBuilder(processor, args.max_length, args.crop_expand_ratio, args.input_mode, args.image_resize)
     train_dataset = make_dataset(train_records).map(
         builder,
         remove_columns=["sample_id", "image_path", "bbox", "label", "seq"],
@@ -467,7 +530,7 @@ def train(args: argparse.Namespace) -> None:
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
 
-    metrics = evaluate_gt(model, processor, val_records, args.crop_expand_ratio, args.max_new_tokens)
+    metrics = evaluate_gt(model, processor, val_records, args.crop_expand_ratio, args.input_mode, args.max_new_tokens)
     metrics_path = Path(args.output_dir) / "gt_crop_eval_metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -480,7 +543,7 @@ def eval_gt(args: argparse.Namespace) -> None:
     base_model, processor = load_model_and_processor(args.base_model, args.load_in_4bit, False)
     model = PeftModel.from_pretrained(base_model, args.adapter_path)
     model.eval()
-    metrics = evaluate_gt(model, processor, records, args.crop_expand_ratio, args.max_new_tokens)
+    metrics = evaluate_gt(model, processor, records, args.crop_expand_ratio, args.input_mode, args.max_new_tokens)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
 
@@ -493,26 +556,29 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--train_json", required=True)
     train_parser.add_argument("--val_json", required=True)
     train_parser.add_argument("--output_dir", default="output/qwen_stage2_cls_gtbox")
+    train_parser.add_argument("--input_mode", choices=["bbox_prompt", "crop"], default="bbox_prompt")
+    train_parser.add_argument("--image_resize", type=int, default=280)
     train_parser.add_argument("--crop_expand_ratio", type=float, default=0.2)
-    train_parser.add_argument("--max_length", type=int, default=2048)
-    train_parser.add_argument("--per_device_train_batch_size", type=int, default=1)
+    train_parser.add_argument("--max_length", type=int, default=8192)
+    train_parser.add_argument("--per_device_train_batch_size", type=int, default=4)
     train_parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
-    train_parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    train_parser.add_argument("--num_train_epochs", type=float, default=3.0)
-    train_parser.add_argument("--learning_rate", type=float, default=2e-4)
+    train_parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    train_parser.add_argument("--num_train_epochs", type=float, default=2.0)
+    train_parser.add_argument("--learning_rate", type=float, default=1e-4)
     train_parser.add_argument("--weight_decay", type=float, default=0.0)
     train_parser.add_argument("--warmup_ratio", type=float, default=0.03)
     train_parser.add_argument("--logging_steps", type=int, default=10)
-    train_parser.add_argument("--save_steps", type=int, default=300)
+    train_parser.add_argument("--save_steps", type=int, default=100)
     train_parser.add_argument("--eval_steps", type=int, default=300)
     train_parser.add_argument("--save_total_limit", type=int, default=2)
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument("--balance_train", action="store_true", default=True)
     train_parser.add_argument("--no_balance_train", action="store_false", dest="balance_train")
     train_parser.add_argument("--load_in_4bit", action="store_true")
-    train_parser.add_argument("--gradient_checkpointing", action="store_true")
-    train_parser.add_argument("--lora_r", type=int, default=16)
-    train_parser.add_argument("--lora_alpha", type=int, default=32)
+    train_parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    train_parser.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing")
+    train_parser.add_argument("--lora_r", type=int, default=64)
+    train_parser.add_argument("--lora_alpha", type=int, default=16)
     train_parser.add_argument("--lora_dropout", type=float, default=0.05)
     train_parser.add_argument("--max_new_tokens", type=int, default=16)
     train_parser.set_defaults(func=train)
@@ -521,6 +587,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--base_model", required=True)
     eval_parser.add_argument("--adapter_path", required=True)
     eval_parser.add_argument("--val_json", required=True)
+    eval_parser.add_argument("--input_mode", choices=["bbox_prompt", "crop"], default="bbox_prompt")
     eval_parser.add_argument("--crop_expand_ratio", type=float, default=0.2)
     eval_parser.add_argument("--load_in_4bit", action="store_true")
     eval_parser.add_argument("--max_new_tokens", type=int, default=16)

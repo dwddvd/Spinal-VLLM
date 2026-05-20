@@ -106,11 +106,29 @@ def classify_candidate(
     record: LesionRecord,
     candidate: CandidateBox,
     crop_expand_ratio: float,
+    input_mode: str,
     max_new_tokens: int,
 ) -> Tuple[str, Optional[str]]:
     bbox = make_non_empty_bbox(candidate.bbox, record.width, record.height)
+    if input_mode == "bbox_prompt":
+        return predict_label(
+            model,
+            processor,
+            record.image_path,
+            record.seq,
+            bbox=bbox,
+            input_mode="bbox_prompt",
+            max_new_tokens=max_new_tokens,
+        )
     crop = crop_image(record.image_path, bbox, crop_expand_ratio)
-    return predict_label(model, processor, crop, record.seq, max_new_tokens=max_new_tokens)
+    return predict_label(
+        model,
+        processor,
+        crop,
+        record.seq,
+        input_mode="crop",
+        max_new_tokens=max_new_tokens,
+    )
 
 
 def evaluate(args: argparse.Namespace) -> None:
@@ -164,6 +182,7 @@ def evaluate(args: argparse.Namespace) -> None:
             record,
             selected,
             crop_expand_ratio=args.crop_expand_ratio,
+            input_mode=args.input_mode,
             max_new_tokens=args.max_new_tokens,
         )
         iou = compute_iou(selected.bbox, record.bbox)
@@ -243,6 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", default="output/yolo_qwen_pipeline")
     parser.add_argument("--top_k", type=int, default=5)
     parser.add_argument("--selection", choices=["top1", "best_iou"], default="top1")
+    parser.add_argument("--input_mode", choices=["bbox_prompt", "crop"], default="bbox_prompt")
     parser.add_argument("--crop_expand_ratio", type=float, default=0.2)
     parser.add_argument("--load_in_4bit", action="store_true")
     parser.add_argument("--max_new_tokens", type=int, default=16)

@@ -14,15 +14,11 @@ python qwen_stage2_classifier.py train \
   --train_json /home/dwd/桌面/Spinal-qwen-finetune/datasets/train_output/data_detcls_vl.json \
   --val_json /home/dwd/桌面/Spinal-qwen-finetune/datasets/val_output/data_detcls_vl.json \
   --output_dir /home/dwd/桌面/Spinal-qwen-finetune/output/qwen_stage2_cls_gtbox \
-  --crop_expand_ratio 0.2 \
-  --num_train_epochs 3 \
-  --learning_rate 2e-4 \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 8 \
+  --input_mode bbox_prompt \
   --load_in_4bit
 ```
 
-This trains only the infection/tumor crop classifier. It does not do detection.
+This follows the earlier successful Qwen classification strategy: use the full image, provide the lesion bbox in the prompt, and train Qwen to output only `感染` or `肿瘤`.
 
 ## 2. Re-evaluate Qwen On GT Crops
 
@@ -31,7 +27,7 @@ python qwen_stage2_classifier.py eval_gt \
   --base_model /home/dwd/桌面/qwen_models/Qwen3.5-0.8B \
   --adapter_path /home/dwd/桌面/Spinal-qwen-finetune/output/qwen_stage2_cls_gtbox \
   --val_json /home/dwd/桌面/Spinal-qwen-finetune/datasets/val_output/data_detcls_vl.json \
-  --crop_expand_ratio 0.2 \
+  --input_mode bbox_prompt \
   --load_in_4bit
 ```
 
@@ -66,7 +62,7 @@ python yolo_qwen_pipeline.py \
   --output_dir /home/dwd/桌面/Spinal-qwen-finetune/output/yolo_qwen_pipeline/yolov8x1280_top5_qwen \
   --top_k 5 \
   --selection top1 \
-  --crop_expand_ratio 0.2 \
+  --input_mode bbox_prompt \
   --load_in_4bit
 ```
 
