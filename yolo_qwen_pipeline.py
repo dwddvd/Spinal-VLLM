@@ -20,6 +20,7 @@ from qwen_stage2_classifier import (
     expand_bbox,
     load_model_and_processor,
     load_records,
+    make_non_empty_bbox,
     normalize_label,
     predict_label,
 )
@@ -107,7 +108,8 @@ def classify_candidate(
     crop_expand_ratio: float,
     max_new_tokens: int,
 ) -> Tuple[str, Optional[str]]:
-    crop = crop_image(record.image_path, candidate.bbox, crop_expand_ratio)
+    bbox = make_non_empty_bbox(candidate.bbox, record.width, record.height)
+    crop = crop_image(record.image_path, bbox, crop_expand_ratio)
     return predict_label(model, processor, crop, record.seq, max_new_tokens=max_new_tokens)
 
 

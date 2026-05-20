@@ -87,13 +87,28 @@ def clamp_bbox(bbox: Tuple[int, int, int, int], width: int, height: int) -> Tupl
     return x1, y1, x2, y2
 
 
+def make_non_empty_bbox(bbox: Tuple[int, int, int, int], width: int, height: int) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = clamp_bbox(bbox, width, height)
+    if x2 <= x1:
+        if x1 < width - 1:
+            x2 = x1 + 1
+        else:
+            x1 = max(0, x1 - 1)
+    if y2 <= y1:
+        if y1 < height - 1:
+            y2 = y1 + 1
+        else:
+            y1 = max(0, y1 - 1)
+    return x1, y1, x2, y2
+
+
 def expand_bbox(bbox: Tuple[int, int, int, int], width: int, height: int, ratio: float) -> Tuple[int, int, int, int]:
     x1, y1, x2, y2 = bbox
     box_w = max(1, x2 - x1)
     box_h = max(1, y2 - y1)
     pad_x = int(round(box_w * ratio))
     pad_y = int(round(box_h * ratio))
-    return clamp_bbox((x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y), width, height)
+    return make_non_empty_bbox((x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y), width, height)
 
 
 def crop_image(image_path: str, bbox: Tuple[int, int, int, int], expand_ratio: float) -> Image.Image:
@@ -126,7 +141,10 @@ def load_records(json_path: str) -> List[LesionRecord]:
             continue
         with Image.open(image_path) as image:
             width, height = image.size
-        bbox = clamp_bbox(bbox, width, height)
+        if width < 2 or height < 2:
+            skipped += 1
+            continue
+        bbox = make_non_empty_bbox(bbox, width, height)
         sample_id = str(item.get("id", "")) or f"sample_{index}"
         patient_id = Path(image_path).name.split("_")[0]
         records.append(
