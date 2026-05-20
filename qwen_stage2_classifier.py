@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -189,6 +190,30 @@ def make_dataset(records: List[LesionRecord]) -> Dataset:
             for r in records
         ]
     )
+
+
+def label_distribution(records: List[LesionRecord]) -> Dict[str, int]:
+    counts = Counter(r.label for r in records)
+    return {"infection": int(counts.get("infection", 0)), "tumor": int(counts.get("tumor", 0))}
+
+
+def balance_records(records: List[LesionRecord], seed: int) -> List[LesionRecord]:
+    by_label: Dict[str, List[LesionRecord]] = {"infection": [], "tumor": []}
+    for record in records:
+        if record.label in by_label:
+            by_label[record.label].append(record)
+
+    max_count = max(len(items) for items in by_label.values())
+    rng = random.Random(seed)
+    balanced: List[LesionRecord] = []
+    for label, items in by_label.items():
+        if not items:
+            continue
+        balanced.extend(items)
+        needed = max_count - len(items)
+        balanced.extend(rng.choice(items) for _ in range(needed))
+    rng.shuffle(balanced)
+    return balanced
 
 
 class QwenCropDatasetBuilder:
@@ -388,6 +413,11 @@ def train(args: argparse.Namespace) -> None:
 
     train_records = load_records(args.train_json)
     val_records = load_records(args.val_json)
+    log(f"Train label distribution before balancing: {label_distribution(train_records)}")
+    log(f"Val label distribution: {label_distribution(val_records)}")
+    if args.balance_train:
+        train_records = balance_records(train_records, args.seed)
+        log(f"Train label distribution after balancing: {label_distribution(train_records)}")
 
     model, processor = load_model_and_processor(args.base_model, args.load_in_4bit, args.gradient_checkpointing)
     model = add_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout)
@@ -477,6 +507,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--eval_steps", type=int, default=300)
     train_parser.add_argument("--save_total_limit", type=int, default=2)
     train_parser.add_argument("--seed", type=int, default=42)
+    train_parser.add_argument("--balance_train", action="store_true", default=True)
+    train_parser.add_argument("--no_balance_train", action="store_false", dest="balance_train")
     train_parser.add_argument("--load_in_4bit", action="store_true")
     train_parser.add_argument("--gradient_checkpointing", action="store_true")
     train_parser.add_argument("--lora_r", type=int, default=16)
