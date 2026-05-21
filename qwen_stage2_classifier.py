@@ -335,7 +335,7 @@ class VLDataCollator:
             "input_ids": torch.stack(batch_input_ids),
             "attention_mask": torch.stack(batch_attention_mask),
             "labels": torch.stack(batch_labels),
-            "pixel_values": torch.stack(pixel_values),
+            "pixel_values": torch.cat(pixel_values, dim=0),
             "image_grid_thw": torch.stack(image_grid_thw),
         }
 
