@@ -3,7 +3,7 @@ import csv
 import json
 import os
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -32,6 +32,14 @@ class CandidateBox:
     rank: int
     conf: float
     bbox: Tuple[int, int, int, int]
+
+
+@dataclass
+class CandidatePrediction:
+    candidate: CandidateBox
+    iou: float
+    pred_text: str
+    pred_label: Optional[str]
 
 
 def log(message: str) -> None:
@@ -93,6 +101,28 @@ def load_candidates(csv_path: str, top_k: int) -> Dict[str, List[CandidateBox]]:
     return by_image
 
 
+def parse_top_ks(raw: str) -> List[int]:
+    values = sorted({int(item.strip()) for item in raw.split(",") if item.strip()})
+    values = [value for value in values if value > 0]
+    if not values:
+        raise ValueError("--top_ks must contain at least one positive integer.")
+    return values
+
+
+def init_metric_bucket() -> Dict[str, object]:
+    return {
+        "images_with_candidate": 0,
+        "det_hits": {0.3: 0, 0.5: 0},
+        "joint_hits": {0.3: 0, 0.5: 0},
+        "top1_cls_correct": 0,
+        "top1_det_hits": {0.3: 0, 0.5: 0},
+        "top1_joint_hits": {0.3: 0, 0.5: 0},
+        "confusion_any_iou0.3": Counter(),
+        "confusion_any_iou0.5": Counter(),
+        "confusion_top1": Counter(),
+    }
+
+
 def load_qwen(base_model: str, adapter_path: str, load_in_4bit: bool):
     base, processor = load_model_and_processor(base_model, load_in_4bit, gradient_checkpointing=False)
     model = PeftModel.from_pretrained(base, adapter_path)
@@ -132,25 +162,25 @@ def classify_candidate(
 
 
 def evaluate(args: argparse.Namespace) -> None:
+    top_ks = parse_top_ks(args.top_ks)
+    max_top_k = max(top_ks)
     records = load_records(args.val_json)
-    candidates = load_candidates(args.pred_csv, args.top_k)
+    candidates = load_candidates(args.pred_csv, max_top_k)
     model, processor = load_qwen(args.base_model, args.adapter_path, args.load_in_4bit)
 
     total = 0
-    has_candidate = 0
-    cls_correct = 0
-    det_hits = {0.3: 0, 0.5: 0}
-    joint_hits = {0.3: 0, 0.5: 0}
-    topk_det_hits = {0.3: 0, 0.5: 0}
+    buckets = {k: init_metric_bucket() for k in top_ks}
     selected_rows: List[Dict[str, object]] = []
-    patient_stats = defaultdict(lambda: {"total": 0, "joint03": 0, "joint05": 0})
 
     for record in tqdm(records, desc="Eval YOLO+Qwen", ncols=120):
         total += 1
-        patient_stats[record.patient_id]["total"] += 1
         image_candidates = candidates.get(image_key(record.image_path), [])
 
         if not image_candidates:
+            for k in top_ks:
+                buckets[k]["confusion_top1"][f"{record.label}->missing"] += 1
+                for threshold in (0.3, 0.5):
+                    buckets[k][f"confusion_any_iou{threshold}"][f"{record.label}->missed"] += 1
             selected_rows.append(
                 {
                     "image_path": record.image_path,
@@ -168,78 +198,88 @@ def evaluate(args: argparse.Namespace) -> None:
             )
             continue
 
-        has_candidate += 1
-        for threshold in topk_det_hits:
-            topk_det_hits[threshold] += int(any(compute_iou(c.bbox, record.bbox) >= threshold for c in image_candidates))
+        predictions: List[CandidatePrediction] = []
+        for candidate in image_candidates:
+            pred_text, pred_label = classify_candidate(
+                model,
+                processor,
+                record,
+                candidate,
+                crop_expand_ratio=args.crop_expand_ratio,
+                input_mode=args.input_mode,
+                max_new_tokens=args.max_new_tokens,
+            )
+            iou = compute_iou(candidate.bbox, record.bbox)
+            predictions.append(CandidatePrediction(candidate=candidate, iou=iou, pred_text=pred_text, pred_label=pred_label))
+            selected_rows.append(
+                {
+                    "image_path": record.image_path,
+                    "gt_label": record.label,
+                    "pred_label": pred_label or "",
+                    "pred_text": pred_text,
+                    "rank": candidate.rank,
+                    "conf": candidate.conf,
+                    "iou": iou,
+                    "x1": candidate.bbox[0],
+                    "y1": candidate.bbox[1],
+                    "x2": candidate.bbox[2],
+                    "y2": candidate.bbox[3],
+                }
+            )
 
-        selected = image_candidates[0]
-        if args.selection == "best_iou":
-            selected = max(image_candidates, key=lambda c: compute_iou(c.bbox, record.bbox))
-
-        pred_text, pred_label = classify_candidate(
-            model,
-            processor,
-            record,
-            selected,
-            crop_expand_ratio=args.crop_expand_ratio,
-            input_mode=args.input_mode,
-            max_new_tokens=args.max_new_tokens,
-        )
-        iou = compute_iou(selected.bbox, record.bbox)
-        label_ok = pred_label == record.label
-        cls_correct += int(label_ok)
-        for threshold in det_hits:
-            det_ok = iou >= threshold
-            det_hits[threshold] += int(det_ok)
-            joint_hits[threshold] += int(det_ok and label_ok)
-        patient_stats[record.patient_id]["joint03"] += int(iou >= 0.3 and label_ok)
-        patient_stats[record.patient_id]["joint05"] += int(iou >= 0.5 and label_ok)
-
-        selected_rows.append(
-            {
-                "image_path": record.image_path,
-                "gt_label": record.label,
-                "pred_label": pred_label or "",
-                "pred_text": pred_text,
-                "rank": selected.rank,
-                "conf": selected.conf,
-                "iou": iou,
-                "x1": selected.bbox[0],
-                "y1": selected.bbox[1],
-                "x2": selected.bbox[2],
-                "y2": selected.bbox[3],
-            }
-        )
-
-    patient_joint03 = 0
-    patient_joint05 = 0
-    for stats in patient_stats.values():
-        patient_joint03 += int(stats["joint03"] / max(stats["total"], 1) > args.patient_positive_ratio)
-        patient_joint05 += int(stats["joint05"] / max(stats["total"], 1) > args.patient_positive_ratio)
+        top1 = predictions[0]
+        for k in top_ks:
+            subset = predictions[:k]
+            bucket = buckets[k]
+            bucket["images_with_candidate"] += 1
+            bucket["top1_cls_correct"] += int(top1.pred_label == record.label)
+            bucket["confusion_top1"][f"{record.label}->{top1.pred_label or 'invalid'}"] += 1
+            for threshold in (0.3, 0.5):
+                det_ok = any(item.iou >= threshold for item in subset)
+                joint_ok = any(item.iou >= threshold and item.pred_label == record.label for item in subset)
+                top1_det_ok = top1.iou >= threshold
+                top1_joint_ok = top1.iou >= threshold and top1.pred_label == record.label
+                bucket["det_hits"][threshold] += int(det_ok)
+                bucket["joint_hits"][threshold] += int(joint_ok)
+                bucket["top1_det_hits"][threshold] += int(top1_det_ok)
+                bucket["top1_joint_hits"][threshold] += int(top1_joint_ok)
+                matching = [item for item in subset if item.iou >= threshold]
+                if matching:
+                    best_match = max(matching, key=lambda item: item.iou)
+                    bucket[f"confusion_any_iou{threshold}"][f"{record.label}->{best_match.pred_label or 'invalid'}"] += 1
+                else:
+                    bucket[f"confusion_any_iou{threshold}"][f"{record.label}->missed"] += 1
 
     metrics = {
         "total_images": total,
-        "images_with_candidate": has_candidate,
-        "candidate_coverage": has_candidate / max(total, 1),
-        "selection": args.selection,
-        "top_k": args.top_k,
+        "top_ks": top_ks,
         "crop_expand_ratio": args.crop_expand_ratio,
-        "selected_det_recall_iou0.3": det_hits[0.3] / max(total, 1),
-        "selected_det_recall_iou0.5": det_hits[0.5] / max(total, 1),
-        "topk_oracle_det_recall_iou0.3": topk_det_hits[0.3] / max(total, 1),
-        "topk_oracle_det_recall_iou0.5": topk_det_hits[0.5] / max(total, 1),
-        "cls_acc_on_selected": cls_correct / max(total, 1),
-        "joint_acc_iou0.3": joint_hits[0.3] / max(total, 1),
-        "joint_acc_iou0.5": joint_hits[0.5] / max(total, 1),
-        "total_patients": len(patient_stats),
-        "patient_joint_acc_iou0.3": patient_joint03 / max(len(patient_stats), 1),
-        "patient_joint_acc_iou0.5": patient_joint05 / max(len(patient_stats), 1),
+        "input_mode": args.input_mode,
+        "per_top_k": {},
     }
+    for k in top_ks:
+        bucket = buckets[k]
+        metrics["per_top_k"][f"top{k}"] = {
+            "images_with_candidate": bucket["images_with_candidate"],
+            "candidate_coverage": bucket["images_with_candidate"] / max(total, 1),
+            "det_recall_iou0.3": bucket["det_hits"][0.3] / max(total, 1),
+            "det_recall_iou0.5": bucket["det_hits"][0.5] / max(total, 1),
+            "joint_acc_iou0.3": bucket["joint_hits"][0.3] / max(total, 1),
+            "joint_acc_iou0.5": bucket["joint_hits"][0.5] / max(total, 1),
+            "top1_cls_acc": bucket["top1_cls_correct"] / max(total, 1),
+            "top1_det_recall_iou0.3": bucket["top1_det_hits"][0.3] / max(total, 1),
+            "top1_det_recall_iou0.5": bucket["top1_det_hits"][0.5] / max(total, 1),
+            "top1_joint_acc_iou0.3": bucket["top1_joint_hits"][0.3] / max(total, 1),
+            "top1_joint_acc_iou0.5": bucket["top1_joint_hits"][0.5] / max(total, 1),
+            "confusion_top1": dict(bucket["confusion_top1"]),
+            "confusion_any_iou0.3": dict(bucket["confusion_any_iou0.3"]),
+            "confusion_any_iou0.5": dict(bucket["confusion_any_iou0.5"]),
+        }
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = output_dir / "pipeline_metrics.json"
-    rows_path = output_dir / "pipeline_predictions.csv"
+    metrics_path = output_dir / "pipeline_topk_metrics.json"
+    rows_path = output_dir / "pipeline_candidate_predictions.csv"
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
     with rows_path.open("w", newline="", encoding="utf-8") as f:
@@ -254,24 +294,25 @@ def evaluate(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate YOLO detector + Qwen crop classifier pipeline.")
+    parser = argparse.ArgumentParser(description="Evaluate YOLO detector + Qwen classifier pipeline for multiple top-k values.")
     parser.add_argument("--base_model", required=True)
     parser.add_argument("--adapter_path", required=True)
     parser.add_argument("--val_json", required=True)
     parser.add_argument("--pred_csv", required=True)
     parser.add_argument("--output_dir", default="output/yolo_qwen_pipeline")
-    parser.add_argument("--top_k", type=int, default=5)
-    parser.add_argument("--selection", choices=["top1", "best_iou"], default="top1")
+    parser.add_argument("--top_ks", default="1,3,5,10", help="Comma-separated top-k values to evaluate in one run.")
+    parser.add_argument("--top_k", type=int, default=None, help="Deprecated alias for evaluating one top-k value.")
     parser.add_argument("--input_mode", choices=["bbox_prompt", "crop"], default="bbox_prompt")
     parser.add_argument("--crop_expand_ratio", type=float, default=0.2)
     parser.add_argument("--load_in_4bit", action="store_true")
     parser.add_argument("--max_new_tokens", type=int, default=16)
-    parser.add_argument("--patient_positive_ratio", type=float, default=0.5)
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.top_k is not None:
+        args.top_ks = str(args.top_k)
     evaluate(args)
 
 
