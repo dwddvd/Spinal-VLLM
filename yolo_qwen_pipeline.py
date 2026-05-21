@@ -47,7 +47,47 @@ def log(message: str) -> None:
 
 
 def image_key(path: str) -> str:
-    return Path(path).name
+    return Path(path).name.lower()
+
+
+def safe_name(raw: str, fallback: str) -> str:
+    name = raw.strip() or fallback
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+    name = name.strip("._")
+    return name or fallback
+
+
+def candidate_keys(path: str) -> List[str]:
+    image_path = Path(path)
+    stem = image_path.stem
+    suffix = image_path.suffix.lower()
+    keys = {
+        image_path.name.lower(),
+        stem.lower(),
+    }
+    without_index = re.sub(r"^\d{6}_", "", stem)
+    keys.add(without_index.lower())
+    if suffix:
+        keys.add(f"{without_index}{suffix}".lower())
+    return list(keys)
+
+
+def record_keys(record: LesionRecord, index: int) -> List[str]:
+    image_path = Path(record.image_path)
+    suffix = image_path.suffix.lower()
+    original_stem = image_path.stem
+    safe_sample = safe_name(record.sample_id, original_stem)
+    yolo_stem = f"{index:06d}_{safe_sample}"
+    keys = {
+        image_path.name.lower(),
+        original_stem.lower(),
+        safe_sample.lower(),
+        yolo_stem.lower(),
+    }
+    if suffix:
+        keys.add(f"{safe_sample}{suffix}".lower())
+        keys.add(f"{yolo_stem}{suffix}".lower())
+    return list(keys)
 
 
 def clamp_bbox(bbox: Tuple[int, int, int, int], width: int, height: int) -> Tuple[int, int, int, int]:
@@ -79,6 +119,7 @@ def compute_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> f
 
 def load_candidates(csv_path: str, top_k: int) -> Dict[str, List[CandidateBox]]:
     by_image: Dict[str, List[CandidateBox]] = defaultdict(list)
+    image_names = set()
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -93,12 +134,25 @@ def load_candidates(csv_path: str, top_k: int) -> Dict[str, List[CandidateBox]]:
                 )
             except (KeyError, ValueError):
                 continue
-            by_image[image_key(candidate.image_path)].append(candidate)
+            image_names.add(image_key(candidate.image_path))
+            for key in candidate_keys(candidate.image_path):
+                by_image[key].append(candidate)
 
     for key in list(by_image.keys()):
         by_image[key] = sorted(by_image[key], key=lambda x: (x.rank, -x.conf))[:top_k]
-    log(f"Loaded YOLO candidates for {len(by_image)} images from {csv_path}.")
+    log(f"Loaded YOLO candidates for {len(image_names)} images from {csv_path}.")
     return by_image
+
+
+def find_candidates(
+    candidates: Dict[str, List[CandidateBox]],
+    record: LesionRecord,
+    index: int,
+) -> List[CandidateBox]:
+    for key in record_keys(record, index):
+        if key in candidates:
+            return candidates[key]
+    return []
 
 
 def parse_top_ks(raw: str) -> List[int]:
@@ -172,9 +226,9 @@ def evaluate(args: argparse.Namespace) -> None:
     buckets = {k: init_metric_bucket() for k in top_ks}
     selected_rows: List[Dict[str, object]] = []
 
-    for record in tqdm(records, desc="Eval YOLO+Qwen", ncols=120):
+    for record_index, record in enumerate(tqdm(records, desc="Eval YOLO+Qwen", ncols=120)):
         total += 1
-        image_candidates = candidates.get(image_key(record.image_path), [])
+        image_candidates = find_candidates(candidates, record, record_index)
 
         if not image_candidates:
             for k in top_ks:
