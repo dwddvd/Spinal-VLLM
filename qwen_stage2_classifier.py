@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,19 @@ from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndByte
 
 INFECTION_ZH = "\u611f\u67d3"
 TUMOR_ZH = "\u80bf\u7624"
+
+
+PYCHARM_DEFAULTS = {
+    "mode": "train",
+    "base_model": "/home/dwd/\u684c\u9762/qwen_models/Qwen3.5-0.8B",
+    "train_json": "/home/dwd/\u684c\u9762/Spinal-qwen-finetune/datasets/train_output/data_detcls_vl.json",
+    "val_json": "/home/dwd/\u684c\u9762/Spinal-qwen-finetune/datasets/val_output/data_detcls_vl.json",
+    "output_dir": "/home/dwd/\u684c\u9762/Spinal-qwen-finetune/output/qwen_stage2_cls_bbox_prompt_debug",
+    "input_mode": "bbox_prompt",
+    "load_in_4bit": True,
+    "limit_train": 0,
+    "limit_val": 0,
+}
 
 
 @dataclass
@@ -487,6 +501,12 @@ def train(args: argparse.Namespace) -> None:
 
     train_records = load_records(args.train_json)
     val_records = load_records(args.val_json)
+    if args.limit_train > 0:
+        train_records = train_records[: args.limit_train]
+        log(f"Debug limit applied to train records: {len(train_records)}")
+    if args.limit_val > 0:
+        val_records = val_records[: args.limit_val]
+        log(f"Debug limit applied to val records: {len(val_records)}")
     log(f"Train label distribution before balancing: {label_distribution(train_records)}")
     log(f"Val label distribution: {label_distribution(val_records)}")
     if args.balance_train:
@@ -583,6 +603,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--eval_steps", type=int, default=300)
     train_parser.add_argument("--save_total_limit", type=int, default=2)
     train_parser.add_argument("--seed", type=int, default=42)
+    train_parser.add_argument("--limit_train", type=int, default=0)
+    train_parser.add_argument("--limit_val", type=int, default=0)
     train_parser.add_argument("--balance_train", action="store_true", default=True)
     train_parser.add_argument("--no_balance_train", action="store_false", dest="balance_train")
     train_parser.add_argument("--load_in_4bit", action="store_true")
@@ -607,8 +629,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def pycharm_default_argv() -> List[str]:
+    argv = [
+        PYCHARM_DEFAULTS["mode"],
+        "--base_model",
+        PYCHARM_DEFAULTS["base_model"],
+        "--train_json",
+        PYCHARM_DEFAULTS["train_json"],
+        "--val_json",
+        PYCHARM_DEFAULTS["val_json"],
+        "--output_dir",
+        PYCHARM_DEFAULTS["output_dir"],
+        "--input_mode",
+        PYCHARM_DEFAULTS["input_mode"],
+    ]
+    if PYCHARM_DEFAULTS.get("load_in_4bit", False):
+        argv.append("--load_in_4bit")
+    if PYCHARM_DEFAULTS.get("limit_train", 0) > 0:
+        argv.extend(["--limit_train", str(PYCHARM_DEFAULTS["limit_train"])])
+    if PYCHARM_DEFAULTS.get("limit_val", 0) > 0:
+        argv.extend(["--limit_val", str(PYCHARM_DEFAULTS["limit_val"])])
+    return argv
+
+
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    if len(sys.argv) == 1:
+        log("No command-line arguments detected; using PYCHARM_DEFAULTS for local debugging.")
+        args = parser.parse_args(pycharm_default_argv())
+    else:
+        args = parser.parse_args()
     args.func(args)
 
 
