@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from datasets import Dataset
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from PIL import Image
 from tqdm import tqdm
@@ -210,21 +209,6 @@ def build_answer(label: str) -> str:
     return label_to_zh(label)
 
 
-def make_dataset(records: List[LesionRecord]) -> Dataset:
-    return Dataset.from_list(
-        [
-            {
-                "sample_id": r.sample_id,
-                "image_path": r.image_path,
-                "bbox": list(r.bbox),
-                "label": r.label,
-                "seq": r.seq,
-            }
-            for r in records
-        ]
-    )
-
-
 def label_distribution(records: List[LesionRecord]) -> Dict[str, int]:
     counts = Counter(r.label for r in records)
     return {"infection": int(counts.get("infection", 0)), "tumor": int(counts.get("tumor", 0))}
@@ -309,7 +293,7 @@ class QwenCropDatasetBuilder:
             pixel_values = pixel_values.squeeze(0)
 
         image_grid_thw = inputs["image_grid_thw"]
-        if image_grid_thw.dim() == 3 and image_grid_thw.size(0) == 1:
+        if image_grid_thw.dim() >= 2 and image_grid_thw.size(0) == 1:
             image_grid_thw = image_grid_thw.squeeze(0)
 
         return {
@@ -319,6 +303,26 @@ class QwenCropDatasetBuilder:
             "pixel_values": pixel_values.tolist(),
             "image_grid_thw": image_grid_thw.tolist(),
         }
+
+
+class QwenLazyDataset(torch.utils.data.Dataset):
+    def __init__(self, records: List[LesionRecord], builder: QwenCropDatasetBuilder):
+        self.records = records
+        self.builder = builder
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> Dict:
+        record = self.records[index]
+        example = {
+            "sample_id": record.sample_id,
+            "image_path": record.image_path,
+            "bbox": list(record.bbox),
+            "label": record.label,
+            "seq": record.seq,
+        }
+        return self.builder(example)
 
 
 class VLDataCollator:
@@ -517,14 +521,9 @@ def train(args: argparse.Namespace) -> None:
     model = add_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout)
 
     builder = QwenCropDatasetBuilder(processor, args.max_length, args.crop_expand_ratio, args.input_mode, args.image_resize)
-    train_dataset = make_dataset(train_records).map(
-        builder,
-        remove_columns=["sample_id", "image_path", "bbox", "label", "seq"],
-    )
-    val_dataset = make_dataset(val_records).map(
-        builder,
-        remove_columns=["sample_id", "image_path", "bbox", "label", "seq"],
-    )
+    train_dataset = QwenLazyDataset(train_records, builder)
+    val_dataset = QwenLazyDataset(val_records, builder)
+    log("Using lazy preprocessing dataset; images are processed batch-by-batch during training.")
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
