@@ -290,12 +290,20 @@ class QwenCropDatasetBuilder:
             attention_mask = attention_mask[: self.max_length]
             labels = labels[: self.max_length]
 
+        pixel_values = inputs["pixel_values"]
+        if pixel_values.dim() == 3 and pixel_values.size(0) == 1:
+            pixel_values = pixel_values.squeeze(0)
+
+        image_grid_thw = inputs["image_grid_thw"]
+        if image_grid_thw.dim() == 3 and image_grid_thw.size(0) == 1:
+            image_grid_thw = image_grid_thw.squeeze(0)
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
-            "pixel_values": inputs["pixel_values"][0].tolist(),
-            "image_grid_thw": inputs["image_grid_thw"][0].tolist(),
+            "pixel_values": pixel_values.tolist(),
+            "image_grid_thw": image_grid_thw.tolist(),
         }
 
 
@@ -315,6 +323,9 @@ class VLDataCollator:
         labels = [self.to_tensor(f["labels"], torch.long) for f in features]
         pixel_values = [self.to_tensor(f["pixel_values"], torch.float32) for f in features]
         image_grid_thw = [self.to_tensor(f["image_grid_thw"], torch.long) for f in features]
+        for value in pixel_values:
+            if value.dim() != 2:
+                raise ValueError(f"Expected pixel_values to be 2D [num_patches, hidden], got shape {tuple(value.shape)}")
 
         max_len = max(x.size(0) for x in input_ids)
         batch_input_ids = []
