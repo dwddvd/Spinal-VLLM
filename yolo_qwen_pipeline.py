@@ -42,6 +42,9 @@ class CandidatePrediction:
     pred_label: Optional[str]
 
 
+FINAL_STRATEGIES = ("top1_conf", "first_valid", "majority_vote", "conf_weighted_vote")
+
+
 def log(message: str) -> None:
     print(f"[INFO] {message}", flush=True)
 
@@ -163,7 +166,25 @@ def parse_top_ks(raw: str) -> List[int]:
     return values
 
 
-def init_metric_bucket() -> Dict[str, object]:
+def parse_strategies(raw: str) -> List[str]:
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    unknown = sorted(set(values) - set(FINAL_STRATEGIES))
+    if unknown:
+        raise ValueError(f"Unknown final selection strategies: {unknown}. Available: {list(FINAL_STRATEGIES)}")
+    return values or list(FINAL_STRATEGIES)
+
+
+def init_final_bucket() -> Dict[str, object]:
+    return {
+        "cls_correct": 0,
+        "det_hits": {0.3: 0, 0.5: 0},
+        "joint_hits": {0.3: 0, 0.5: 0},
+        "confusion": Counter(),
+        "selected_rank": Counter(),
+    }
+
+
+def init_metric_bucket(strategies: List[str]) -> Dict[str, object]:
     return {
         "images_with_candidate": 0,
         "det_hits": {0.3: 0, 0.5: 0},
@@ -174,7 +195,37 @@ def init_metric_bucket() -> Dict[str, object]:
         "confusion_any_iou0.3": Counter(),
         "confusion_any_iou0.5": Counter(),
         "confusion_top1": Counter(),
+        "final": {strategy: init_final_bucket() for strategy in strategies},
     }
+
+
+def select_prediction(strategy: str, predictions: List[CandidatePrediction]) -> CandidatePrediction:
+    valid = [item for item in predictions if item.pred_label in {"infection", "tumor"}]
+    if strategy == "top1_conf":
+        return predictions[0]
+    if strategy == "first_valid":
+        return valid[0] if valid else predictions[0]
+    if not valid:
+        return predictions[0]
+
+    if strategy == "majority_vote":
+        count_score = Counter(item.pred_label for item in valid)
+        conf_score = defaultdict(float)
+        for item in valid:
+            conf_score[item.pred_label] += item.candidate.conf
+        winner = max(count_score, key=lambda label: (count_score[label], conf_score[label]))
+        return max([item for item in valid if item.pred_label == winner], key=lambda item: item.candidate.conf)
+
+    if strategy == "conf_weighted_vote":
+        conf_score = defaultdict(float)
+        count_score = Counter()
+        for item in valid:
+            conf_score[item.pred_label] += item.candidate.conf
+            count_score[item.pred_label] += 1
+        winner = max(conf_score, key=lambda label: (conf_score[label], count_score[label]))
+        return max([item for item in valid if item.pred_label == winner], key=lambda item: item.candidate.conf)
+
+    raise ValueError(f"Unsupported final selection strategy: {strategy}")
 
 
 def load_qwen(base_model: str, adapter_path: str, load_in_4bit: bool):
@@ -217,14 +268,16 @@ def classify_candidate(
 
 def evaluate(args: argparse.Namespace) -> None:
     top_ks = parse_top_ks(args.top_ks)
+    strategies = parse_strategies(args.final_strategies)
     max_top_k = max(top_ks)
     records = load_records(args.val_json)
     candidates = load_candidates(args.pred_csv, max_top_k)
     model, processor = load_qwen(args.base_model, args.adapter_path, args.load_in_4bit)
 
     total = 0
-    buckets = {k: init_metric_bucket() for k in top_ks}
+    buckets = {k: init_metric_bucket(strategies) for k in top_ks}
     selected_rows: List[Dict[str, object]] = []
+    final_rows: List[Dict[str, object]] = []
 
     for record_index, record in enumerate(tqdm(records, desc="Eval YOLO+Qwen", ncols=120)):
         total += 1
@@ -235,6 +288,10 @@ def evaluate(args: argparse.Namespace) -> None:
                 buckets[k]["confusion_top1"][f"{record.label}->missing"] += 1
                 for threshold in (0.3, 0.5):
                     buckets[k][f"confusion_any_iou{threshold}"][f"{record.label}->missed"] += 1
+                for strategy in strategies:
+                    final_bucket = buckets[k]["final"][strategy]
+                    final_bucket["confusion"][f"{record.label}->missing"] += 1
+                    final_bucket["selected_rank"]["missing"] += 1
             selected_rows.append(
                 {
                     "image_path": record.image_path,
@@ -304,9 +361,39 @@ def evaluate(args: argparse.Namespace) -> None:
                 else:
                     bucket[f"confusion_any_iou{threshold}"][f"{record.label}->missed"] += 1
 
+            for strategy in strategies:
+                selected = select_prediction(strategy, subset)
+                final_bucket = bucket["final"][strategy]
+                label_ok = selected.pred_label == record.label
+                final_bucket["cls_correct"] += int(label_ok)
+                final_bucket["confusion"][f"{record.label}->{selected.pred_label or 'invalid'}"] += 1
+                final_bucket["selected_rank"][str(selected.candidate.rank)] += 1
+                for threshold in (0.3, 0.5):
+                    det_ok = selected.iou >= threshold
+                    final_bucket["det_hits"][threshold] += int(det_ok)
+                    final_bucket["joint_hits"][threshold] += int(det_ok and label_ok)
+                final_rows.append(
+                    {
+                        "image_path": record.image_path,
+                        "gt_label": record.label,
+                        "top_k": k,
+                        "strategy": strategy,
+                        "pred_label": selected.pred_label or "",
+                        "pred_text": selected.pred_text,
+                        "rank": selected.candidate.rank,
+                        "conf": selected.candidate.conf,
+                        "iou": selected.iou,
+                        "x1": selected.candidate.bbox[0],
+                        "y1": selected.candidate.bbox[1],
+                        "x2": selected.candidate.bbox[2],
+                        "y2": selected.candidate.bbox[3],
+                    }
+                )
+
     metrics = {
         "total_images": total,
         "top_ks": top_ks,
+        "final_strategies": strategies,
         "crop_expand_ratio": args.crop_expand_ratio,
         "input_mode": args.input_mode,
         "per_top_k": {},
@@ -328,12 +415,25 @@ def evaluate(args: argparse.Namespace) -> None:
             "confusion_top1": dict(bucket["confusion_top1"]),
             "confusion_any_iou0.3": dict(bucket["confusion_any_iou0.3"]),
             "confusion_any_iou0.5": dict(bucket["confusion_any_iou0.5"]),
+            "final_selection": {},
         }
+        for strategy in strategies:
+            final_bucket = bucket["final"][strategy]
+            metrics["per_top_k"][f"top{k}"]["final_selection"][strategy] = {
+                "cls_acc": final_bucket["cls_correct"] / max(total, 1),
+                "selected_det_recall_iou0.3": final_bucket["det_hits"][0.3] / max(total, 1),
+                "selected_det_recall_iou0.5": final_bucket["det_hits"][0.5] / max(total, 1),
+                "selected_joint_acc_iou0.3": final_bucket["joint_hits"][0.3] / max(total, 1),
+                "selected_joint_acc_iou0.5": final_bucket["joint_hits"][0.5] / max(total, 1),
+                "confusion": dict(final_bucket["confusion"]),
+                "selected_rank": dict(final_bucket["selected_rank"]),
+            }
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "pipeline_topk_metrics.json"
     rows_path = output_dir / "pipeline_candidate_predictions.csv"
+    final_rows_path = output_dir / "pipeline_final_selections.csv"
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
     with rows_path.open("w", newline="", encoding="utf-8") as f:
@@ -341,10 +441,16 @@ def evaluate(args: argparse.Namespace) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(selected_rows)
+    with final_rows_path.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["image_path", "gt_label", "top_k", "strategy", "pred_label", "pred_text", "rank", "conf", "iou", "x1", "y1", "x2", "y2"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(final_rows)
 
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     log(f"Saved metrics to {metrics_path}")
     log(f"Saved predictions to {rows_path}")
+    log(f"Saved final selections to {final_rows_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -356,6 +462,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", default="output/yolo_qwen_pipeline")
     parser.add_argument("--top_ks", default="1,3,5,10", help="Comma-separated top-k values to evaluate in one run.")
     parser.add_argument("--top_k", type=int, default=None, help="Deprecated alias for evaluating one top-k value.")
+    parser.add_argument(
+        "--final_strategies",
+        default="top1_conf,first_valid,majority_vote,conf_weighted_vote",
+        help="Comma-separated final box/class selection strategies.",
+    )
     parser.add_argument("--input_mode", choices=["bbox_prompt", "crop"], default="bbox_prompt")
     parser.add_argument("--crop_expand_ratio", type=float, default=0.2)
     parser.add_argument("--load_in_4bit", action="store_true")
