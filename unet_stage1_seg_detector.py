@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -39,9 +40,21 @@ def load_npz(path: str) -> Tuple[np.ndarray, np.ndarray]:
     mask = data["mask"]
     if image.ndim != 3 or mask.ndim != 3:
         raise ValueError(f"{path} image/mask must be 3D [D,H,W]; got image={image.shape}, mask={mask.shape}")
-    if image.shape != mask.shape:
-        raise ValueError(f"{path} image/mask shape mismatch: image={image.shape}, mask={mask.shape}")
+    if image.shape[0] != mask.shape[0]:
+        raise ValueError(f"{path} image/mask depth mismatch: image={image.shape}, mask={mask.shape}")
+    if image.shape[1:] != mask.shape[1:]:
+        mask = resize_mask_volume(mask, image.shape[1:])
     return image, mask
+
+
+def resize_mask_volume(mask: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
+    target_h, target_w = target_hw
+    resized = []
+    for z in range(mask.shape[0]):
+        pil_mask = Image.fromarray(mask[z])
+        pil_mask = pil_mask.resize((target_w, target_h), resample=Image.Resampling.NEAREST)
+        resized.append(np.asarray(pil_mask, dtype=mask.dtype))
+    return np.stack(resized, axis=0)
 
 
 def normalize_image(image: np.ndarray) -> np.ndarray:
@@ -155,6 +168,7 @@ def prepare(args: argparse.Namespace) -> None:
             out_path = slice_dir / case_split / out_name
             out_path.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(out_path, image=image[z].astype(np.float32), mask=mask[z].astype(np.uint8))
+            rel_slice_path = out_path.relative_to(output_dir).as_posix()
             x1, y1, x2, y2 = bbox_from_mask(mask[z])
             rows.append(
                 {
@@ -164,7 +178,7 @@ def prepare(args: argparse.Namespace) -> None:
                     "seq": case["seq"],
                     "seq_id": case["seq_id"],
                     "slice_index": z,
-                    "slice_path": str(out_path),
+                    "slice_path": rel_slice_path,
                     "source_npz": case["npz_path"],
                     "has_mask": int(mask[z].sum() > 0),
                     "mask_area": int(mask[z].sum()),
@@ -200,6 +214,7 @@ def prepare(args: argparse.Namespace) -> None:
 
 class SliceDataset(Dataset):
     def __init__(self, manifest_path: str, split: str):
+        self.manifest_dir = Path(manifest_path).resolve().parent
         with open(manifest_path, "r", encoding="utf-8") as f:
             self.rows = [row for row in csv.DictReader(f) if row["split"] == split]
 
@@ -208,7 +223,10 @@ class SliceDataset(Dataset):
 
     def __getitem__(self, index: int):
         row = self.rows[index]
-        data = np.load(row["slice_path"])
+        slice_path = Path(row["slice_path"])
+        if not slice_path.is_absolute():
+            slice_path = self.manifest_dir / slice_path
+        data = np.load(slice_path)
         image = torch.from_numpy(data["image"].astype(np.float32))[None, ...]
         mask = torch.from_numpy(data["mask"].astype(np.float32))[None, ...]
         return image, mask
