@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -23,6 +24,13 @@ class DetectionRecord:
     bbox_xyxy: Tuple[int, int, int, int]
     width: int
     height: int
+
+
+@dataclass
+class PredBox:
+    rank: int
+    conf: float
+    bbox_xyxy: Tuple[int, int, int, int]
 
 
 def log(message: str) -> None:
@@ -109,6 +117,35 @@ def safe_stem(sample_id: str, image_path: Path, index: int) -> str:
     if not raw:
         raw = image_path.stem
     return f"{index:06d}_{raw}"
+
+
+def image_key(path: str) -> str:
+    return Path(path).name.lower()
+
+
+def prediction_keys(path: str) -> List[str]:
+    image_path = Path(path)
+    stem = image_path.stem
+    suffix = image_path.suffix.lower()
+    without_index = re.sub(r"^\d{6}_", "", stem)
+    keys = {image_path.name.lower(), stem.lower(), without_index.lower()}
+    if suffix:
+        keys.add(f"{without_index}{suffix}".lower())
+    return list(keys)
+
+
+def record_keys(record: DetectionRecord, index: int) -> List[str]:
+    image_path = record.image_path
+    suffix = image_path.suffix.lower()
+    yolo_stem = safe_stem(record.sample_id, image_path, index)
+    keys = {
+        image_path.name.lower(),
+        image_path.stem.lower(),
+        yolo_stem.lower(),
+    }
+    if suffix:
+        keys.add(f"{yolo_stem}{suffix}".lower())
+    return list(keys)
 
 
 def load_records(json_path: Path, image_root: Optional[Path] = None) -> List[DetectionRecord]:
@@ -388,6 +425,113 @@ def recall_at_iou(args: argparse.Namespace) -> None:
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
 
+def parse_float_list(raw: str) -> List[float]:
+    values = [float(item.strip()) for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("Expected at least one float value.")
+    return values
+
+
+def parse_int_list(raw: str) -> List[int]:
+    values = sorted({int(item.strip()) for item in raw.split(",") if item.strip()})
+    values = [value for value in values if value > 0]
+    if not values:
+        raise ValueError("Expected at least one positive integer value.")
+    return values
+
+
+def load_prediction_csv(pred_csv: Path, top_k: int) -> Dict[str, List[PredBox]]:
+    predictions: Dict[str, List[PredBox]] = defaultdict(list)
+    unique_images = set()
+    with pred_csv.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if not row.get("rank") or not row.get("x1"):
+                continue
+            try:
+                pred = PredBox(
+                    rank=int(row["rank"]),
+                    conf=float(row["conf"]),
+                    bbox_xyxy=(int(row["x1"]), int(row["y1"]), int(row["x2"]), int(row["y2"])),
+                )
+            except (KeyError, ValueError):
+                continue
+            unique_images.add(image_key(row["image_path"]))
+            for key in prediction_keys(row["image_path"]):
+                predictions[key].append(pred)
+
+    for key in list(predictions.keys()):
+        predictions[key] = sorted(predictions[key], key=lambda item: (item.rank, -item.conf))[:top_k]
+    log(f"Loaded YOLO predictions for {len(unique_images)} images from {pred_csv}.")
+    return predictions
+
+
+def find_predictions(predictions: Dict[str, List[PredBox]], record: DetectionRecord, index: int) -> List[PredBox]:
+    for key in record_keys(record, index):
+        if key in predictions:
+            return predictions[key]
+    return []
+
+
+def recall_from_predictions(args: argparse.Namespace) -> None:
+    records = load_records(Path(args.val_json), image_root=Path(args.image_root).resolve() if args.image_root else None)
+    top_ks = parse_int_list(args.top_ks)
+    thresholds = parse_float_list(args.thresholds)
+    predictions = load_prediction_csv(Path(args.pred_csv), max(top_ks))
+
+    total = 0
+    has_candidate = 0
+    hits = {top_k: {thr: 0 for thr in thresholds} for top_k in top_ks}
+    best_ious: List[Dict[str, object]] = []
+
+    for index, record in enumerate(records):
+        total += 1
+        record_predictions = find_predictions(predictions, record, index)
+        if not record_predictions:
+            best_ious.append({"image_path": str(record.image_path), "best_iou": 0.0, "top_k": 0})
+            continue
+        has_candidate += 1
+        for top_k in top_ks:
+            selected = record_predictions[:top_k]
+            best_iou = max(compute_iou(pred.bbox_xyxy, record.bbox_xyxy) for pred in selected) if selected else 0.0
+            for thr in thresholds:
+                hits[top_k][thr] += int(best_iou >= thr)
+        best_all = max(compute_iou(pred.bbox_xyxy, record.bbox_xyxy) for pred in record_predictions)
+        best_ious.append({"image_path": str(record.image_path), "best_iou": best_all, "top_k": len(record_predictions)})
+
+    metrics = {
+        "total_images": total,
+        "images_with_candidate": has_candidate,
+        "candidate_coverage": has_candidate / max(total, 1),
+        "pred_csv": str(args.pred_csv),
+        "top_ks": top_ks,
+        "thresholds": thresholds,
+        "per_top_k": {},
+    }
+    for top_k in top_ks:
+        metrics["per_top_k"][f"top{top_k}"] = {
+            f"recall@iou{thr:g}": hits[top_k][thr] / max(total, 1)
+            for thr in thresholds
+        }
+
+    if args.output_json:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+        log(f"Saved metrics to {output_path}")
+    if args.output_csv:
+        output_path = Path(args.output_csv)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["image_path", "best_iou", "top_k"])
+            writer.writeheader()
+            writer.writerows(best_ious)
+        log(f"Saved per-image best IoU to {output_path}")
+
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stage-1 YOLO lesion detector for spinal MRI.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -451,6 +595,16 @@ def build_parser() -> argparse.ArgumentParser:
     recall.add_argument("--max_det", type=int, default=10)
     recall.add_argument("--thresholds", default="0.3,0.5")
     recall.set_defaults(func=recall_at_iou)
+
+    pred_csv_recall = subparsers.add_parser("pred_csv_recall", help="Compute top-k detection recall from an exported YOLO prediction CSV.")
+    pred_csv_recall.add_argument("--pred_csv", required=True)
+    pred_csv_recall.add_argument("--val_json", default=DEFAULT_VAL_JSON)
+    pred_csv_recall.add_argument("--image_root", default=None)
+    pred_csv_recall.add_argument("--top_ks", default="1,3,5,10")
+    pred_csv_recall.add_argument("--thresholds", default="0.3,0.5")
+    pred_csv_recall.add_argument("--output_json", default=None)
+    pred_csv_recall.add_argument("--output_csv", default=None)
+    pred_csv_recall.set_defaults(func=recall_from_predictions)
 
     return parser
 
