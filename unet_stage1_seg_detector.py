@@ -213,8 +213,9 @@ def prepare(args: argparse.Namespace) -> None:
 
 
 class SliceDataset(Dataset):
-    def __init__(self, manifest_path: str, split: str):
+    def __init__(self, manifest_path: str, split: str, image_size: int):
         self.manifest_dir = Path(manifest_path).resolve().parent
+        self.image_size = image_size
         with open(manifest_path, "r", encoding="utf-8") as f:
             self.rows = [row for row in csv.DictReader(f) if row["split"] == split]
 
@@ -229,6 +230,9 @@ class SliceDataset(Dataset):
         data = np.load(slice_path)
         image = torch.from_numpy(data["image"].astype(np.float32))[None, ...]
         mask = torch.from_numpy(data["mask"].astype(np.float32))[None, ...]
+        if self.image_size > 0 and image.shape[-2:] != (self.image_size, self.image_size):
+            image = F.interpolate(image[None], size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)[0]
+            mask = F.interpolate(mask[None], size=(self.image_size, self.image_size), mode="nearest")[0]
         return image, mask
 
 
@@ -281,8 +285,8 @@ def dice_loss(logits, targets, eps: float = 1e-6):
 
 def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device if torch.cuda.is_available() and args.device != "cpu" else "cpu")
-    train_set = SliceDataset(args.manifest, "train")
-    val_set = SliceDataset(args.manifest, "val")
+    train_set = SliceDataset(args.manifest, "train", args.image_size)
+    val_set = SliceDataset(args.manifest, "val", args.image_size)
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     model = SmallUNet(base=args.base_channels).to(device)
@@ -429,6 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_p.add_argument("--output_dir", default="output/unet_stage1_seg")
     train_p.add_argument("--epochs", type=int, default=80)
     train_p.add_argument("--batch_size", type=int, default=8)
+    train_p.add_argument("--image_size", type=int, default=512)
     train_p.add_argument("--lr", type=float, default=1e-3)
     train_p.add_argument("--weight_decay", type=float, default=1e-4)
     train_p.add_argument("--base_channels", type=int, default=32)
