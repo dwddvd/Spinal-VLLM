@@ -409,6 +409,89 @@ def predict(args: argparse.Namespace) -> None:
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
 
+def resize_tensor_pair(image: torch.Tensor, mask: torch.Tensor, image_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    if image_size > 0 and image.shape[-2:] != (image_size, image_size):
+        image = F.interpolate(image[None], size=(image_size, image_size), mode="bilinear", align_corners=False)[0]
+        mask = F.interpolate(mask[None], size=(image_size, image_size), mode="nearest")[0]
+    return image, mask
+
+
+def predict_manifest(args: argparse.Namespace) -> None:
+    device = torch.device(args.device if torch.cuda.is_available() and args.device != "cpu" else "cpu")
+    model = load_model(args.weights, device)
+    manifest_path = Path(args.manifest)
+    manifest_dir = manifest_path.resolve().parent
+    with manifest_path.open("r", encoding="utf-8") as f:
+        rows = [row for row in csv.DictReader(f) if row["split"] == args.split]
+
+    output_rows = []
+    dice_scores = []
+    hits = {0.3: 0, 0.5: 0}
+    total_positive = 0
+
+    for row in tqdm(rows, desc=f"Predict UNet {args.split} slices", ncols=120):
+        slice_path = Path(row["slice_path"])
+        if not slice_path.is_absolute():
+            slice_path = manifest_dir / slice_path
+        data = np.load(slice_path)
+        image = torch.from_numpy(data["image"].astype(np.float32))[None, ...]
+        mask = torch.from_numpy(data["mask"].astype(np.float32))[None, ...]
+        image, mask = resize_tensor_pair(image, mask, args.image_size)
+        with torch.no_grad():
+            prob = torch.sigmoid(model(image[None].to(device)))[0, 0].detach().cpu().numpy()
+        pred_mask = (prob >= args.threshold).astype(np.uint8)
+        gt_mask = mask[0].numpy().astype(np.uint8)
+        pred_bbox = bbox_from_mask(pred_mask)
+        gt_bbox = bbox_from_mask(gt_mask)
+        iou = compute_iou(pred_bbox, gt_bbox)
+        pred_area = int(pred_mask.sum())
+        gt_area = int(gt_mask.sum())
+        if gt_area > 0:
+            total_positive += 1
+            for thr in hits:
+                hits[thr] += int(iou >= thr)
+            den = pred_area + gt_area
+            dice_scores.append((2.0 * int((pred_mask & gt_mask).sum()) + 1e-6) / (den + 1e-6))
+        output_rows.append(
+            {
+                **row,
+                "pred_area": pred_area,
+                "pred_x1": pred_bbox[0],
+                "pred_y1": pred_bbox[1],
+                "pred_x2": pred_bbox[2],
+                "pred_y2": pred_bbox[3],
+                "bbox_iou": iou,
+            }
+        )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows_path = output_dir / f"unet_{args.split}_slice_predictions.csv"
+    with rows_path.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = list(output_rows[0].keys()) if output_rows else []
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(output_rows)
+
+    metrics = {
+        "split": args.split,
+        "total_slices": len(rows),
+        "positive_slices": total_positive,
+        "threshold": args.threshold,
+        "image_size": args.image_size,
+        "mean_dice_positive_slices": float(np.mean(dice_scores)) if dice_scores else 0.0,
+        "slice_bbox_recall@iou0.3": hits[0.3] / max(total_positive, 1),
+        "slice_bbox_recall@iou0.5": hits[0.5] / max(total_positive, 1),
+        "predictions_csv": str(rows_path),
+    }
+    metrics_path = output_dir / f"unet_{args.split}_manifest_metrics.json"
+    with metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    log(f"Saved predictions to {rows_path}")
+    log(f"Saved metrics to {metrics_path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="2D UNet stage-1 lesion segmentation detector from 3D npz image/mask volumes.")
     sub = parser.add_subparsers(dest="mode", required=True)
@@ -449,6 +532,16 @@ def build_parser() -> argparse.ArgumentParser:
     predict_p.add_argument("--threshold", type=float, default=0.5)
     predict_p.add_argument("--device", default="cuda:0")
     predict_p.set_defaults(func=predict)
+
+    predict_manifest_p = sub.add_parser("predict_manifest")
+    predict_manifest_p.add_argument("--weights", required=True)
+    predict_manifest_p.add_argument("--manifest", default="datasets/unet_stage1_seg/manifest.csv")
+    predict_manifest_p.add_argument("--output_dir", default="output/unet_stage1_seg_manifest_eval")
+    predict_manifest_p.add_argument("--split", choices=["train", "val"], default="val")
+    predict_manifest_p.add_argument("--threshold", type=float, default=0.5)
+    predict_manifest_p.add_argument("--image_size", type=int, default=512)
+    predict_manifest_p.add_argument("--device", default="cuda:0")
+    predict_manifest_p.set_defaults(func=predict_manifest)
 
     return parser
 
