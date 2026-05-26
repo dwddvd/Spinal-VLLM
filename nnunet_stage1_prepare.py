@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 DEFAULT_INFECTION_DIR = r"H:\Lab\Bone\dataset\infection dataset\npz"
 DEFAULT_TUMOR_DIR = r"H:\Lab\Bone\dataset\tumor_fuse_mask_remove_margin"
+DEFAULT_NNUNET_RAW = "nnUNet_raw"
 
 
 def log(message: str) -> None:
@@ -117,7 +118,7 @@ def write_dataset_json(output_dir: Path, dataset_id: int, dataset_name: str, tra
 def prepare(args: argparse.Namespace) -> None:
     nib = require_nibabel()
     dataset_name = f"Dataset{args.dataset_id:03d}_{args.dataset_name}"
-    output_dir = Path(args.nnunet_raw) / dataset_name
+    output_dir = Path(args.nnunet_raw).resolve() / dataset_name
     images_tr = output_dir / "imagesTr"
     labels_tr = output_dir / "labelsTr"
     images_ts = output_dir / "imagesTs"
@@ -171,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_p = sub.add_parser("prepare")
     prepare_p.add_argument("--infection_dir", default=DEFAULT_INFECTION_DIR)
     prepare_p.add_argument("--tumor_dir", default=DEFAULT_TUMOR_DIR)
-    prepare_p.add_argument("--nnunet_raw", required=True, help="Path to nnUNet_raw directory.")
+    prepare_p.add_argument("--nnunet_raw", default=DEFAULT_NNUNET_RAW, help="Path to nnUNet_raw directory. Defaults to a project-local relative directory.")
     prepare_p.add_argument("--dataset_id", type=int, default=501)
     prepare_p.add_argument("--dataset_name", default="SpinalLesionSeq")
     prepare_p.add_argument("--val_ratio", type=float, default=0.2)
