@@ -45,11 +45,34 @@ def extract_slice_index(path: str) -> Optional[int]:
     return None
 
 
+def extract_patient_id(path_or_text: str) -> Optional[str]:
+    matches = re.findall(r"\d{6,}", str(path_or_text))
+    return matches[-1] if matches else None
+
+
+def seq_from_path(path: str) -> str:
+    text = str(path).upper()
+    name = Path(path).stem.upper()
+    if re.search(r"(?:^|[_-])1(?:[_-]|$)", name) or "T1" in text:
+        return "T1"
+    if re.search(r"(?:^|[_-])2(?:[_-]|$)", name) or "T2" in text:
+        return "T2"
+    return ""
+
+
+def record_patient_id(record: LesionRecord) -> str:
+    return extract_patient_id(record.image_path) or extract_patient_id(record.sample_id) or record.patient_id
+
+
+def record_seq(record: LesionRecord) -> str:
+    return normalize_seq(record.seq) or seq_from_path(record.image_path)
+
+
 def build_qwen_index(records: List[LesionRecord]) -> Dict[Tuple[str, str], List[Tuple[int, LesionRecord]]]:
     index: Dict[Tuple[str, str], List[Tuple[int, LesionRecord]]] = defaultdict(list)
     for record_idx, record in enumerate(records):
-        patient_id = record.patient_id
-        seq = normalize_seq(record.seq)
+        patient_id = record_patient_id(record)
+        seq = record_seq(record)
         index[(patient_id, seq)].append((record_idx, record))
     return index
 
@@ -107,7 +130,9 @@ def evaluate(args: argparse.Namespace) -> None:
         manifest_items = json.load(f)
     manifest = {item["case_id"]: item for item in manifest_items}
 
-    qwen_records = load_records(args.val_json)
+    qwen_records = []
+    for json_path in args.qwen_json:
+        qwen_records.extend(load_records(json_path))
     qwen_index = build_qwen_index(qwen_records)
     model, processor = load_qwen(args.base_model, args.adapter_path, args.load_in_4bit)
 
@@ -141,7 +166,15 @@ def evaluate(args: argparse.Namespace) -> None:
         _, record, method = find_qwen_record(candidates, selected_z, gt_bbox_scaled_for_match)
         match_methods[method] += 1
         if record is None:
-            rows.append({"case_id": case_id, "match_method": method})
+            rows.append(
+                {
+                    "case_id": case_id,
+                    "match_method": method,
+                    "patient_id": meta.get("patient_id", ""),
+                    "seq": meta.get("seq", ""),
+                    "qwen_candidates_for_patient": sum(len(items) for (patient, _), items in qwen_index.items() if patient == str(meta["patient_id"])),
+                }
+            )
             continue
 
         matched += 1
@@ -201,6 +234,8 @@ def evaluate(args: argparse.Namespace) -> None:
         "joint_acc@iou0.3": joint_hits[0.3] / max(matched, 1),
         "joint_acc@iou0.5": joint_hits[0.5] / max(matched, 1),
         "confusion": dict(confusion),
+        "qwen_records_loaded": len(qwen_records),
+        "qwen_patient_seq_keys": len(qwen_index),
     }
 
     output_dir = Path(args.output_dir)
@@ -224,7 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pred_dir", required=True)
     parser.add_argument("--label_dir", required=True)
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--val_json", required=True)
+    parser.add_argument("--qwen_json", "--val_json", nargs="+", required=True, help="One or more Qwen detcls JSON files used to map patient/sequence back to original images.")
     parser.add_argument("--output_dir", default="output/nnunet_qwen_remap_pipeline")
     parser.add_argument("--coord_mode", choices=["xy", "swap_xy"], default="xy")
     parser.add_argument("--load_in_4bit", action="store_true")
