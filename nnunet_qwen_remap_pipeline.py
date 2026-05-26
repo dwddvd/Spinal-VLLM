@@ -242,7 +242,30 @@ def evaluate(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     rows_path = output_dir / "nnunet_qwen_remap_predictions.csv"
     with rows_path.open("w", newline="", encoding="utf-8") as f:
-        fieldnames = list(rows[0].keys()) if rows else []
+        preferred = [
+            "case_id",
+            "match_method",
+            "patient_id",
+            "seq",
+            "selected_slice",
+            "qwen_image_path",
+            "gt_label",
+            "pred_label",
+            "pred_text",
+            "det_iou_qwen_bbox",
+            "scaled_nnunet_gt_iou_to_qwen_gt",
+            "pred_x1",
+            "pred_y1",
+            "pred_x2",
+            "pred_y2",
+            "qwen_gt_x1",
+            "qwen_gt_y1",
+            "qwen_gt_x2",
+            "qwen_gt_y2",
+            "qwen_candidates_for_patient",
+        ]
+        all_fields = sorted({key for row in rows for key in row.keys()})
+        fieldnames = [key for key in preferred if key in all_fields] + [key for key in all_fields if key not in preferred]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
