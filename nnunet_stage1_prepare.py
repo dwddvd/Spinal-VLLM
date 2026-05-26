@@ -1,8 +1,9 @@
 import argparse
 import json
 import random
+import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -12,6 +13,8 @@ from tqdm import tqdm
 DEFAULT_INFECTION_DIR = r"H:\Lab\Bone\dataset\infection dataset\npz"
 DEFAULT_TUMOR_DIR = r"H:\Lab\Bone\dataset\tumor_fuse_mask_remove_margin"
 DEFAULT_NNUNET_RAW = "nnUNet_raw"
+INFECTION_ZH = "\u611f\u67d3"
+TUMOR_ZH = "\u80bf\u7624"
 
 
 def log(message: str) -> None:
@@ -49,6 +52,105 @@ def list_cases(infection_dir: str, tumor_dir: str) -> List[Dict[str, str]]:
     for path in sorted(Path(tumor_dir).glob("*.npz")):
         cases.append(parse_case(path, "tumor"))
     return cases
+
+
+def extract_patient_id(text: str) -> Optional[str]:
+    matches = re.findall(r"\d{6,}", str(text))
+    return matches[-1] if matches else None
+
+
+def extract_image_path(text: str) -> Optional[str]:
+    match = re.search(r"<\|vision_start\|>(.*?)<\|vision_end\|>", text, flags=re.S)
+    return match.group(1).strip() if match else None
+
+
+def infer_sequence(text: str) -> Optional[str]:
+    match = re.search(r"\b([Tt][12](?:WI)?)\b", text)
+    return match.group(1).upper() if match else None
+
+
+def normalize_label(text: str) -> Optional[str]:
+    low = str(text).lower()
+    if "infection" in low or INFECTION_ZH in str(text):
+        return "infection"
+    if "tumor" in low or "tumour" in low or TUMOR_ZH in str(text):
+        return "tumor"
+    return None
+
+
+def normalize_seq(seq: Optional[str]) -> str:
+    if not seq:
+        return ""
+    seq = seq.upper()
+    if "T1" in seq or seq.endswith("_1") or seq == "1":
+        return "T1"
+    if "T2" in seq or seq.endswith("_2") or seq == "2":
+        return "T2"
+    return seq
+
+
+def seq_from_path(path: str) -> str:
+    text = str(path).upper()
+    name = Path(path).stem.upper()
+    if re.search(r"(?:^|[_-])1(?:[_-]|$)", name) or "T1" in text:
+        return "T1"
+    if re.search(r"(?:^|[_-])2(?:[_-]|$)", name) or "T2" in text:
+        return "T2"
+    return ""
+
+
+def case_seq(seq_id: str) -> str:
+    return "T1" if seq_id == "1" else "T2" if seq_id == "2" else normalize_seq(seq_id)
+
+
+def load_qwen_patient_seq_set(json_path: str) -> set:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    result = set()
+    skipped = 0
+    for item in data:
+        convs = item.get("conversations", [])
+        if not convs:
+            skipped += 1
+            continue
+        user_text = convs[0].get("value", "")
+        assistant_text = convs[1].get("value", "") if len(convs) > 1 else ""
+        image_path = extract_image_path(user_text) or ""
+        label = normalize_label(assistant_text)
+        patient_id = extract_patient_id(image_path) or extract_patient_id(str(item.get("id", "")))
+        seq = normalize_seq(infer_sequence(user_text)) or seq_from_path(image_path)
+        if patient_id is None or label is None:
+            skipped += 1
+            continue
+        result.add((patient_id, seq))
+    log(f"Loaded {len(result)} patient/sequence keys from {json_path}; skipped {skipped}.")
+    return result
+
+
+def qwen_json_split(cases: List[Dict[str, str]], train_json: str, val_json: str, missing_policy: str) -> Dict[str, str]:
+    train_keys = load_qwen_patient_seq_set(train_json)
+    val_keys = load_qwen_patient_seq_set(val_json)
+    split = {}
+    stats = {"train": 0, "val": 0, "missing": 0, "conflict": 0}
+    for case in cases:
+        key = (case["patient_id"], case_seq(case["seq_id"]))
+        in_train = key in train_keys
+        in_val = key in val_keys
+        if in_val and not in_train:
+            split[case["case_id"]] = "val"
+            stats["val"] += 1
+        elif in_train and not in_val:
+            split[case["case_id"]] = "train"
+            stats["train"] += 1
+        elif in_train and in_val:
+            split[case["case_id"]] = "val"
+            stats["conflict"] += 1
+        else:
+            stats["missing"] += 1
+            if missing_policy != "skip":
+                split[case["case_id"]] = missing_policy
+    log(f"Qwen split assignment stats: {stats}")
+    return split
 
 
 def resize_mask_volume(mask: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
@@ -127,16 +229,22 @@ def prepare(args: argparse.Namespace) -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
     cases = list_cases(args.infection_dir, args.tumor_dir)
-    split = stratified_patient_split(cases, args.val_ratio, args.seed)
+    if args.qwen_train_json and args.qwen_val_json:
+        split = qwen_json_split(cases, args.qwen_train_json, args.qwen_val_json, args.missing_policy)
+    else:
+        patient_split = stratified_patient_split(cases, args.val_ratio, args.seed)
+        split = {case["case_id"]: patient_split[case["patient_id"]] for case in cases}
     affine = np.diag([1.0, 1.0, 1.0, 1.0])
     manifest = []
     train_count = 0
     val_count = 0
 
     for case in tqdm(cases, desc="Convert npz to nnU-Net", ncols=120):
+        if case["case_id"] not in split:
+            continue
         image, mask = load_npz(case["npz_path"])
         case_id = case["case_id"]
-        case_split = split[case["patient_id"]]
+        case_split = split[case_id]
         image_nifti = nib.Nifti1Image(to_nnunet_xyz(image), affine)
         mask_nifti = nib.Nifti1Image(to_nnunet_xyz(mask).astype(np.uint8), affine)
         if case_split == "train":
@@ -177,6 +285,9 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_p.add_argument("--dataset_name", default="SpinalLesionSeq")
     prepare_p.add_argument("--val_ratio", type=float, default=0.2)
     prepare_p.add_argument("--seed", type=int, default=42)
+    prepare_p.add_argument("--qwen_train_json", default=None)
+    prepare_p.add_argument("--qwen_val_json", default=None)
+    prepare_p.add_argument("--missing_policy", choices=["train", "val", "skip"], default="train")
     prepare_p.set_defaults(func=prepare)
     return parser
 
