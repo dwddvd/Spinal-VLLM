@@ -15,6 +15,9 @@ runs/
 wandb/
 swanlog/
 swanlab/
+nnUNet_raw/
+nnUNet_preprocessed/
+nnUNet_results/
 
 # Model checkpoints and weights
 *.pt
