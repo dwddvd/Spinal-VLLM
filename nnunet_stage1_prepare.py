@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import random
 import re
@@ -10,8 +11,8 @@ from PIL import Image
 from tqdm import tqdm
 
 
-DEFAULT_INFECTION_DIR = r"H:\Lab\Bone\dataset\infection dataset\npz"
-DEFAULT_TUMOR_DIR = r"H:\Lab\Bone\dataset\tumor_fuse_mask_remove_margin"
+DEFAULT_INFECTION_DIR = "data/private/infection_npz"
+DEFAULT_TUMOR_DIR = "data/private/tumor_npz"
 DEFAULT_NNUNET_RAW = "nnUNet_raw"
 INFECTION_ZH = "\u611f\u67d3"
 TUMOR_ZH = "\u80bf\u7624"
@@ -153,6 +154,24 @@ def qwen_json_split(cases: List[Dict[str, str]], train_json: str, val_json: str,
     return split
 
 
+def load_split_csv(path: str) -> Dict[str, str]:
+    split = {}
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"case_id", "split"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"{path} missing columns: {sorted(missing)}")
+        for row in reader:
+            case_id = row["case_id"].strip()
+            case_split = row["split"].strip().lower()
+            if case_split not in {"train", "val"}:
+                raise ValueError(f"{path} has invalid split={case_split!r} for case_id={case_id}")
+            split[case_id] = case_split
+    log(f"Loaded {len(split)} case split entries from {path}.")
+    return split
+
+
 def resize_mask_volume(mask: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
     target_h, target_w = target_hw
     resized = []
@@ -229,7 +248,9 @@ def prepare(args: argparse.Namespace) -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
     cases = list_cases(args.infection_dir, args.tumor_dir)
-    if args.qwen_train_json and args.qwen_val_json:
+    if args.split_csv:
+        split = load_split_csv(args.split_csv)
+    elif args.qwen_train_json and args.qwen_val_json:
         split = qwen_json_split(cases, args.qwen_train_json, args.qwen_val_json, args.missing_policy)
     else:
         patient_split = stratified_patient_split(cases, args.val_ratio, args.seed)
@@ -285,6 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_p.add_argument("--dataset_name", default="SpinalLesionSeq")
     prepare_p.add_argument("--val_ratio", type=float, default=0.2)
     prepare_p.add_argument("--seed", type=int, default=42)
+    prepare_p.add_argument("--split_csv", default=None, help="Fixed case-level split CSV with case_id and split columns.")
     prepare_p.add_argument("--qwen_train_json", default=None)
     prepare_p.add_argument("--qwen_val_json", default=None)
     prepare_p.add_argument("--missing_policy", choices=["train", "val", "skip"], default="train")

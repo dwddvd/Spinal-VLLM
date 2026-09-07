@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import os
 import random
@@ -13,19 +14,21 @@ import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from PIL import Image
 from tqdm import tqdm
-from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig, Trainer, TrainingArguments
+from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig, Trainer, TrainerCallback, TrainingArguments
 
 
 INFECTION_ZH = "\u611f\u67d3"
 TUMOR_ZH = "\u80bf\u7624"
+INFECTION_MOJIBAKE = "\u93b0\u71b8\u714b"
+TUMOR_MOJIBAKE = "\u9472\u8de8\u69eb"
 
 
 PYCHARM_DEFAULTS = {
     "mode": "train",
-    "base_model": "/home/dwd/\u684c\u9762/qwen_models/Qwen3.5-0.8B",
-    "train_json": "/home/dwd/\u684c\u9762/Spinal-qwen-finetune/datasets/train_output/data_detcls_vl.json",
-    "val_json": "/home/dwd/\u684c\u9762/Spinal-qwen-finetune/datasets/val_output/data_detcls_vl.json",
-    "output_dir": "/home/dwd/\u684c\u9762/Spinal-qwen-finetune/output/qwen_stage2_cls_bbox_prompt_debug",
+    "base_model": "models/Qwen3.5-4B",
+    "train_json": "data/internal/train.json",
+    "val_json": "data/internal/validation.json",
+    "output_dir": "outputs/qwen_stage2_adapter",
     "input_mode": "bbox_prompt",
     "load_in_4bit": True,
     "limit_train": 0,
@@ -43,10 +46,18 @@ class LesionRecord:
     height: int
     patient_id: str
     seq: Optional[str] = None
+    prompt_text: Optional[str] = None
+    answer_text: Optional[str] = None
+    case_id: Optional[str] = None
+    slice_idx: Optional[int] = None
 
 
 def log(message: str) -> None:
     print(f"[INFO] {message}", flush=True)
+
+
+def slugify_name(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "_", text.strip()).strip("_").lower()
 
 
 def set_seed(seed: int) -> None:
@@ -59,6 +70,10 @@ def set_seed(seed: int) -> None:
 def extract_image_path(text: str) -> Optional[str]:
     match = re.search(r"<\|vision_start\|>(.*?)<\|vision_end\|>", text, flags=re.S)
     return match.group(1).strip() if match else None
+
+
+def extract_prompt_text(text: str) -> str:
+    return text.split("<|vision_start|>")[0].strip()
 
 
 def extract_bbox(text: str) -> Optional[Tuple[int, int, int, int]]:
@@ -76,9 +91,9 @@ def extract_bbox(text: str) -> Optional[Tuple[int, int, int, int]]:
 
 def normalize_label(text: str) -> Optional[str]:
     low = text.lower()
-    if "infection" in low or INFECTION_ZH in text:
+    if "infection" in low or INFECTION_ZH in text or INFECTION_MOJIBAKE in text:
         return "infection"
-    if "tumor" in low or "tumour" in low or TUMOR_ZH in text:
+    if "tumor" in low or "tumour" in low or TUMOR_ZH in text or TUMOR_MOJIBAKE in text:
         return "tumor"
     return None
 
@@ -156,8 +171,10 @@ def load_records(json_path: str) -> List[LesionRecord]:
         user_text = convs[0].get("value", "")
         assistant_text = convs[1].get("value", "")
         image_path = extract_image_path(user_text)
-        bbox = extract_bbox(assistant_text) or extract_bbox(user_text)
-        label = normalize_label(assistant_text)
+        bbox_value = item.get("bbox")
+        bbox = tuple(bbox_value) if isinstance(bbox_value, list) and len(bbox_value) == 4 else None
+        bbox = bbox or extract_bbox(assistant_text) or extract_bbox(user_text)
+        label = item.get("label") or normalize_label(assistant_text)
         if image_path is None or bbox is None or label is None or not os.path.exists(image_path):
             skipped += 1
             continue
@@ -168,7 +185,13 @@ def load_records(json_path: str) -> List[LesionRecord]:
             continue
         bbox = make_non_empty_bbox(bbox, width, height)
         sample_id = str(item.get("id", "")) or f"sample_{index}"
-        patient_id = Path(image_path).name.split("_")[0]
+        patient_id = str(item.get("patient_id") or item.get("slice_manifest", {}).get("patient_id") or Path(image_path).name.split("_")[0])
+        seq = item.get("seq") or item.get("slice_manifest", {}).get("seq") or infer_sequence(user_text)
+        slice_idx = item.get("slice_idx", item.get("slice_manifest", {}).get("slice_idx"))
+        try:
+            slice_idx = int(slice_idx) if slice_idx is not None and str(slice_idx) != "" else None
+        except (TypeError, ValueError):
+            slice_idx = None
         records.append(
             LesionRecord(
                 sample_id=sample_id,
@@ -178,19 +201,38 @@ def load_records(json_path: str) -> List[LesionRecord]:
                 width=width,
                 height=height,
                 patient_id=patient_id,
-                seq=infer_sequence(user_text),
+                seq=seq,
+                prompt_text=extract_prompt_text(user_text),
+                answer_text=assistant_text.strip(),
+                case_id=item.get("case_id") or item.get("slice_manifest", {}).get("case_id"),
+                slice_idx=slice_idx,
             )
         )
     log(f"Loaded {len(records)} records from {json_path}; skipped {skipped}.")
     return records
 
 
-def build_prompt(seq: Optional[str], bbox: Optional[Tuple[int, int, int, int]] = None, input_mode: str = "bbox_prompt") -> str:
+def build_prompt(
+    seq: Optional[str],
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    input_mode: str = "bbox_prompt",
+    prompt_style: str = "clean",
+) -> str:
     seq_text = f"\u5e8f\u5217\u4e3a{seq}\u3002" if seq else ""
     if input_mode == "bbox_prompt":
         if bbox is None:
             raise ValueError("bbox_prompt mode requires bbox.")
         x1, y1, x2, y2 = bbox
+        if prompt_style == "legacy":
+            return (
+                f"\u73b0\u5728\u4f60\u662f\u4e00\u4e2a\u9aa8\u79d1\u4e13\u5bb6\uff0c"
+                f"\u8fd9\u662f\u4e00\u5e45\u810a\u690e\u7684\u78c1\u5171\u632f\u56fe\u50cf\uff0c{seq_text}"
+                f"\u8be5\u56fe\u50cf\u4e2d\u53ef\u80fd\u5305\u542b\u4e86\u6570\u4e2a\u75c5\u7076\uff0c"
+                f"\u7136\u540e\u6211\u4f1a\u5c06\u6700\u5927\u75c5\u7076\u7684\u5750\u6807\u4f4d\u7f6e"
+                f"\u6309\u7167[x1,y1,x2,y2]\u7684\u683c\u5f0f\u7ed9\u51fa\uff1a"
+                f"\u8be5\u5f20\u56fe\u7247\u4e2d\u7684\u6700\u5927\u75c5\u7076\u5728[{x1},{y1},{x2},{y2}]\u8fd9\u4e2a\u4f4d\u7f6e\u3002"
+                f"\u8bf7\u4f60\u5e2e\u6211\u5224\u65ad\u8fd9\u4e2a\u75c5\u7076\u5c5e\u4e8e{INFECTION_ZH}\u8fd8\u662f{TUMOR_ZH}\u3002"
+            )
         return (
             f"\u8fd9\u662f\u4e00\u5e45\u810a\u690e\u7684\u78c1\u5171\u632f\u56fe\u50cf\uff0c{seq_text}"
             f"\u5176\u4e2d\u75c5\u7076\u7684\u4f4d\u7f6e\u6309\u7167[x1,y1,x2,y2]\u7684\u683c\u5f0f\u5728"
@@ -205,7 +247,11 @@ def build_prompt(seq: Optional[str], bbox: Optional[Tuple[int, int, int, int]] =
     )
 
 
-def build_answer(label: str) -> str:
+def build_answer(label: str, answer_style: str = "short", original_answer: Optional[str] = None) -> str:
+    if answer_style == "original" and original_answer:
+        return original_answer
+    if answer_style == "legacy":
+        return f"\u8fd9\u4e2a\u75c5\u7076\u7684\u7c7b\u578b\u4e3a{label_to_zh(label)}\u3002"
     return label_to_zh(label)
 
 
@@ -234,13 +280,24 @@ def balance_records(records: List[LesionRecord], seed: int) -> List[LesionRecord
 
 
 class QwenCropDatasetBuilder:
-    def __init__(self, processor, max_length: int, crop_expand_ratio: float, input_mode: str, image_resize: int):
+    def __init__(
+        self,
+        processor,
+        max_length: int,
+        crop_expand_ratio: float,
+        input_mode: str,
+        image_resize: int,
+        prompt_style: str,
+        answer_style: str,
+    ):
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.max_length = max_length
         self.crop_expand_ratio = crop_expand_ratio
         self.input_mode = input_mode
         self.image_resize = image_resize
+        self.prompt_style = prompt_style
+        self.answer_style = answer_style
 
     def __call__(self, example: Dict) -> Dict:
         bbox = tuple(example["bbox"])
@@ -249,12 +306,16 @@ class QwenCropDatasetBuilder:
             if self.image_resize > 0:
                 image_content["resized_height"] = self.image_resize
                 image_content["resized_width"] = self.image_resize
-            prompt = build_prompt(example.get("seq"), bbox=bbox, input_mode=self.input_mode)
+            if self.prompt_style == "original" and example.get("prompt_text"):
+                prompt = example["prompt_text"]
+            else:
+                style = "legacy" if self.prompt_style == "original" else self.prompt_style
+                prompt = build_prompt(example.get("seq"), bbox=bbox, input_mode=self.input_mode, prompt_style=style)
         else:
             crop = crop_image(example["image_path"], bbox, self.crop_expand_ratio)
             image_content = {"type": "image", "image": crop}
-            prompt = build_prompt(example.get("seq"), bbox=None, input_mode=self.input_mode)
-        answer = build_answer(example["label"])
+            prompt = build_prompt(example.get("seq"), bbox=None, input_mode=self.input_mode, prompt_style=self.prompt_style)
+        answer = build_answer(example["label"], self.answer_style, example.get("answer_text"))
         messages = [
             {
                 "role": "user",
@@ -321,6 +382,8 @@ class QwenLazyDataset(torch.utils.data.Dataset):
             "bbox": list(record.bbox),
             "label": record.label,
             "seq": record.seq,
+            "prompt_text": record.prompt_text,
+            "answer_text": record.answer_text,
         }
         return self.builder(example)
 
@@ -371,8 +434,11 @@ class VLDataCollator:
 
 def load_model_and_processor(model_name_or_path: str, load_in_4bit: bool, gradient_checkpointing: bool):
     processor = AutoProcessor.from_pretrained(model_name_or_path, trust_remote_code=True)
-    if processor.tokenizer.pad_token_id is None:
-        processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+    tokenizer = getattr(processor, "tokenizer", processor)
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    if not hasattr(processor, "tokenizer"):
+        processor.tokenizer = tokenizer
 
     kwargs = {"trust_remote_code": True, "device_map": "auto"}
     if load_in_4bit:
@@ -393,6 +459,52 @@ def load_model_and_processor(model_name_or_path: str, load_in_4bit: bool, gradie
     return model, processor
 
 
+def resolve_resume_checkpoint(value: Optional[str], output_dir: str) -> Optional[str]:
+    if not value:
+        return None
+
+    if value.lower() != "auto":
+        checkpoint = Path(value).expanduser().resolve()
+        if not checkpoint.is_dir():
+            raise FileNotFoundError(f"Resume checkpoint directory not found: {checkpoint}")
+        return str(checkpoint)
+
+    output_path = Path(output_dir)
+    valid_checkpoints = []
+    incomplete_checkpoints = []
+    for checkpoint in output_path.glob("checkpoint-*"):
+        match = re.fullmatch(r"checkpoint-(\d+)", checkpoint.name)
+        if not match or not checkpoint.is_dir():
+            continue
+        required_files = [
+            checkpoint / "trainer_state.json",
+            checkpoint / "optimizer.pt",
+            checkpoint / "scheduler.pt",
+            checkpoint / "adapter_config.json",
+        ]
+        has_adapter_weights = any(
+            (checkpoint / filename).is_file()
+            for filename in ("adapter_model.safetensors", "adapter_model.bin")
+        )
+        if all(path.is_file() for path in required_files) and has_adapter_weights:
+            valid_checkpoints.append((int(match.group(1)), checkpoint))
+        else:
+            incomplete_checkpoints.append(checkpoint.name)
+
+    if incomplete_checkpoints:
+        log(
+            "Ignoring incomplete checkpoints: "
+            + ", ".join(sorted(incomplete_checkpoints))
+        )
+    if not valid_checkpoints:
+        log(f"No complete checkpoint found in {output_path}; starting training from step 0.")
+        return None
+
+    _, checkpoint = max(valid_checkpoints, key=lambda item: item[0])
+    log(f"Resuming training from complete checkpoint: {checkpoint}")
+    return str(checkpoint)
+
+
 def add_lora(model, r: int, alpha: int, dropout: float):
     config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -408,12 +520,16 @@ def add_lora(model, r: int, alpha: int, dropout: float):
     return model
 
 
-def build_messages(prompt: str, image) -> List[Dict]:
+def build_messages(prompt: str, image, image_resize: int = 0) -> List[Dict]:
+    image_content = {"type": "image", "image": image}
+    if image_resize > 0:
+        image_content["resized_height"] = image_resize
+        image_content["resized_width"] = image_resize
     return [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image},
+                image_content,
                 {"type": "text", "text": prompt},
             ],
         }
@@ -451,11 +567,13 @@ def predict_label(
     bbox: Optional[Tuple[int, int, int, int]] = None,
     input_mode: str = "crop",
     max_new_tokens: int = 16,
+    prompt_style: str = "clean",
+    image_resize: int = 0,
 ) -> Tuple[str, Optional[str]]:
     text = generate_text(
         model,
         processor,
-        build_messages(build_prompt(seq, bbox=bbox, input_mode=input_mode), image),
+        build_messages(build_prompt(seq, bbox=bbox, input_mode=input_mode, prompt_style=prompt_style), image, image_resize),
         max_new_tokens=max_new_tokens,
     )
     return text, normalize_label(text)
@@ -468,35 +586,177 @@ def evaluate_gt(
     crop_expand_ratio: float,
     input_mode: str,
     max_new_tokens: int,
+    prompt_style: str,
+    image_resize: int,
+    output_csv: Optional[str] = None,
+    show_progress: bool = True,
 ) -> Dict[str, float]:
     correct = 0
     total = 0
     confusion = {"infection->infection": 0, "infection->tumor": 0, "tumor->infection": 0, "tumor->tumor": 0, "invalid": 0}
-    for record in tqdm(records, desc="Eval Qwen GT crops", ncols=100):
+    rows = []
+    progress = tqdm(records, desc="Eval Qwen GT crops", ncols=160) if show_progress else records
+    for record in progress:
         if input_mode == "bbox_prompt":
             image = record.image_path
             bbox = record.bbox
         else:
             image = crop_image(record.image_path, record.bbox, crop_expand_ratio)
             bbox = None
-        _, pred = predict_label(
-            model,
-            processor,
-            image,
-            record.seq,
-            bbox=bbox,
-            input_mode=input_mode,
-            max_new_tokens=max_new_tokens,
-        )
+        if prompt_style == "original" and record.prompt_text:
+            text = generate_text(
+                model,
+                processor,
+                build_messages(record.prompt_text, image, image_resize),
+                max_new_tokens=max_new_tokens,
+            )
+            pred = normalize_label(text)
+        else:
+            text, pred = predict_label(
+                model,
+                processor,
+                image,
+                record.seq,
+                bbox=bbox,
+                input_mode=input_mode,
+                max_new_tokens=max_new_tokens,
+                prompt_style=prompt_style,
+                image_resize=image_resize,
+            )
         total += 1
         correct += int(pred == record.label)
         if pred in {"infection", "tumor"}:
             confusion[f"{record.label}->{pred}"] += 1
         else:
             confusion["invalid"] += 1
+        preview = text.replace("\n", " ").replace("\r", " ").strip()
+        if len(preview) > 36:
+            preview = preview[:36] + "..."
+        if show_progress:
+            progress.set_postfix(
+                {
+                    "gt": record.label,
+                    "pred": pred or "invalid",
+                    "acc": f"{correct / max(total, 1):.4f}",
+                    "invalid": confusion["invalid"],
+                    "text": preview,
+                },
+                refresh=True,
+            )
+        if output_csv:
+            x1, y1, x2, y2 = record.bbox
+            rows.append(
+                {
+                    "sample_id": record.sample_id,
+                    "patient_id": record.patient_id,
+                    "seq": record.seq or "",
+                    "image_path": record.image_path,
+                    "bbox_x1": x1,
+                    "bbox_y1": y1,
+                    "bbox_x2": x2,
+                    "bbox_y2": y2,
+                    "gt_label": record.label,
+                    "pred_label": pred or "invalid",
+                    "correct": int(pred == record.label),
+                    "generated_text": text,
+                    "prompt_style": prompt_style,
+                }
+            )
     metrics = {"cls_acc": correct / max(total, 1), "total": total}
     metrics.update(confusion)
+    if output_csv:
+        output_path = Path(output_csv)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "sample_id",
+            "patient_id",
+            "seq",
+            "image_path",
+            "bbox_x1",
+            "bbox_y1",
+            "bbox_x2",
+            "bbox_y2",
+            "gt_label",
+            "pred_label",
+            "correct",
+            "generated_text",
+            "prompt_style",
+        ]
+        with output_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        log(f"Saved per-sample predictions to {output_path}")
     return metrics
+
+
+class MidEvalGTCallback(TrainerCallback):
+    def __init__(
+        self,
+        processor,
+        val_records: List[LesionRecord],
+        crop_expand_ratio: float,
+        input_mode: str,
+        max_new_tokens: int,
+        prompt_style: str,
+        image_resize: int,
+        seed: int,
+        max_samples: int,
+        shuffle_records: bool,
+    ) -> None:
+        records = list(val_records)
+        if shuffle_records:
+            rng = random.Random(seed)
+            rng.shuffle(records)
+        if max_samples > 0:
+            records = records[:max_samples]
+        self.processor = processor
+        self.eval_records = records
+        self.crop_expand_ratio = crop_expand_ratio
+        self.input_mode = input_mode
+        self.max_new_tokens = max_new_tokens
+        self.prompt_style = prompt_style
+        self.image_resize = image_resize
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        model = kwargs.get("model")
+        metrics = kwargs.get("metrics")
+        if model is None or not self.eval_records:
+            return control
+        was_training = model.training
+        model.eval()
+        eval_metrics = evaluate_gt(
+            model,
+            self.processor,
+            self.eval_records,
+            self.crop_expand_ratio,
+            self.input_mode,
+            self.max_new_tokens,
+            self.prompt_style,
+            self.image_resize,
+            output_csv=None,
+            show_progress=False,
+        )
+        prefixed = {
+            "mid_eval_cls_acc": eval_metrics.get("cls_acc", 0.0),
+            "mid_eval_total": eval_metrics.get("total", 0),
+            "mid_eval_invalid": eval_metrics.get("invalid", 0),
+            "mid_eval_inf_inf": eval_metrics.get("infection->infection", 0),
+            "mid_eval_inf_tum": eval_metrics.get("infection->tumor", 0),
+            "mid_eval_tum_inf": eval_metrics.get("tumor->infection", 0),
+            "mid_eval_tum_tum": eval_metrics.get("tumor->tumor", 0),
+        }
+        if isinstance(metrics, dict):
+            metrics.update(prefixed)
+        log(
+            f"Mid-eval step {state.global_step}: "
+            f"cls_acc={prefixed['mid_eval_cls_acc']:.4f}, "
+            f"invalid={prefixed['mid_eval_invalid']}, "
+            f"total={prefixed['mid_eval_total']}"
+        )
+        if was_training:
+            model.train()
+        return control
 
 
 def train(args: argparse.Namespace) -> None:
@@ -518,9 +778,22 @@ def train(args: argparse.Namespace) -> None:
         log(f"Train label distribution after balancing: {label_distribution(train_records)}")
 
     model, processor = load_model_and_processor(args.base_model, args.load_in_4bit, args.gradient_checkpointing)
-    model = add_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout)
+    if args.init_adapter_path:
+        log(f"Initializing trainable LoRA adapter from {args.init_adapter_path}")
+        model = PeftModel.from_pretrained(model, args.init_adapter_path, is_trainable=True)
+        model.print_trainable_parameters()
+    else:
+        model = add_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout)
 
-    builder = QwenCropDatasetBuilder(processor, args.max_length, args.crop_expand_ratio, args.input_mode, args.image_resize)
+    builder = QwenCropDatasetBuilder(
+        processor,
+        args.max_length,
+        args.crop_expand_ratio,
+        args.input_mode,
+        args.image_resize,
+        args.prompt_style,
+        args.answer_style,
+    )
     train_dataset = QwenLazyDataset(train_records, builder)
     val_dataset = QwenLazyDataset(val_records, builder)
     log("Using lazy preprocessing dataset; images are processed batch-by-batch during training.")
@@ -555,25 +828,83 @@ def train(args: argparse.Namespace) -> None:
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=VLDataCollator(processor.tokenizer.pad_token_id),
+        callbacks=[
+            MidEvalGTCallback(
+                processor=processor,
+                val_records=val_records,
+                crop_expand_ratio=args.crop_expand_ratio,
+                input_mode=args.input_mode,
+                max_new_tokens=args.max_new_tokens,
+                prompt_style=args.prompt_style,
+                image_resize=args.image_resize,
+                seed=args.seed,
+                max_samples=args.mid_eval_max_samples,
+                shuffle_records=args.mid_eval_shuffle,
+            )
+        ] if args.mid_eval_cls_metrics else None,
     )
-    trainer.train()
+    resume_checkpoint = resolve_resume_checkpoint(args.resume_from_checkpoint, args.output_dir)
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
 
-    metrics = evaluate_gt(model, processor, val_records, args.crop_expand_ratio, args.input_mode, args.max_new_tokens)
+    if args.skip_final_eval:
+        log("Skipped post-training generative evaluation as requested; adapter and processor were saved.")
+        return
+
+    eval_tag = f"{args.input_mode}_eval_{args.prompt_style}_prompt"
+    eval_slug = slugify_name(eval_tag)
+    predictions_path = Path(args.output_dir) / "gt_crop_eval_predictions.csv"
+    predictions_alias_path = Path(args.output_dir) / f"{eval_slug}_predictions.csv"
+    metrics = evaluate_gt(
+        model,
+        processor,
+        val_records,
+        args.crop_expand_ratio,
+        args.input_mode,
+        args.max_new_tokens,
+        args.prompt_style,
+        args.image_resize,
+        str(predictions_path),
+    )
+    metrics["eval_input_mode"] = args.input_mode
+    metrics["eval_prompt_style"] = args.prompt_style
+    metrics["eval_predictions_csv"] = str(predictions_path)
+    metrics["eval_predictions_alias_csv"] = str(predictions_alias_path)
     metrics_path = Path(args.output_dir) / "gt_crop_eval_metrics.json"
+    metrics_alias_path = Path(args.output_dir) / f"{eval_slug}_metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
+    with metrics_alias_path.open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+    if predictions_path.exists():
+        with predictions_path.open("r", encoding="utf-8") as src, predictions_alias_path.open("w", encoding="utf-8") as dst:
+            dst.write(src.read())
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     log(f"Saved metrics to {metrics_path}")
+    log(f"Saved alias metrics to {metrics_alias_path}")
 
 
 def eval_gt(args: argparse.Namespace) -> None:
     records = load_records(args.val_json)
+    if args.shuffle_eval:
+        rng = random.Random(args.seed)
+        rng.shuffle(records)
+        log(f"Shuffled eval records with seed={args.seed}.")
     base_model, processor = load_model_and_processor(args.base_model, args.load_in_4bit, False)
     model = PeftModel.from_pretrained(base_model, args.adapter_path)
     model.eval()
-    metrics = evaluate_gt(model, processor, records, args.crop_expand_ratio, args.input_mode, args.max_new_tokens)
+    metrics = evaluate_gt(
+        model,
+        processor,
+        records,
+        args.crop_expand_ratio,
+        args.input_mode,
+        args.max_new_tokens,
+        args.prompt_style,
+        args.image_resize,
+        args.output_csv,
+    )
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
 
@@ -586,7 +917,10 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--train_json", required=True)
     train_parser.add_argument("--val_json", required=True)
     train_parser.add_argument("--output_dir", default="output/qwen_stage2_cls_gtbox")
+    train_parser.add_argument("--init_adapter_path", default=None, help="Optional existing LoRA adapter to continue fine-tuning from.")
     train_parser.add_argument("--input_mode", choices=["bbox_prompt", "crop"], default="bbox_prompt")
+    train_parser.add_argument("--prompt_style", choices=["clean", "legacy", "original"], default="clean")
+    train_parser.add_argument("--answer_style", choices=["short", "legacy", "original"], default="short")
     train_parser.add_argument("--image_resize", type=int, default=280)
     train_parser.add_argument("--crop_expand_ratio", type=float, default=0.2)
     train_parser.add_argument("--max_length", type=int, default=8192)
@@ -601,6 +935,11 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--save_steps", type=int, default=100)
     train_parser.add_argument("--eval_steps", type=int, default=300)
     train_parser.add_argument("--save_total_limit", type=int, default=2)
+    train_parser.add_argument(
+        "--resume_from_checkpoint",
+        default=None,
+        help="Checkpoint directory to resume from, or 'auto' to use the latest complete checkpoint in output_dir.",
+    )
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument("--limit_train", type=int, default=0)
     train_parser.add_argument("--limit_val", type=int, default=0)
@@ -613,6 +952,16 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--lora_alpha", type=int, default=16)
     train_parser.add_argument("--lora_dropout", type=float, default=0.05)
     train_parser.add_argument("--max_new_tokens", type=int, default=16)
+    train_parser.add_argument("--mid_eval_cls_metrics", action="store_true", default=True)
+    train_parser.add_argument("--no_mid_eval_cls_metrics", action="store_false", dest="mid_eval_cls_metrics")
+    train_parser.add_argument("--mid_eval_max_samples", type=int, default=200)
+    train_parser.add_argument("--mid_eval_shuffle", action="store_true", default=True)
+    train_parser.add_argument("--no_mid_eval_shuffle", action="store_false", dest="mid_eval_shuffle")
+    train_parser.add_argument(
+        "--skip_final_eval",
+        action="store_true",
+        help="Save the trained adapter without running the post-training generative validation pass.",
+    )
     train_parser.set_defaults(func=train)
 
     eval_parser = subparsers.add_parser("eval_gt")
@@ -620,9 +969,14 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--adapter_path", required=True)
     eval_parser.add_argument("--val_json", required=True)
     eval_parser.add_argument("--input_mode", choices=["bbox_prompt", "crop"], default="bbox_prompt")
+    eval_parser.add_argument("--prompt_style", choices=["clean", "legacy", "original"], default="clean")
+    eval_parser.add_argument("--image_resize", type=int, default=280)
     eval_parser.add_argument("--crop_expand_ratio", type=float, default=0.2)
     eval_parser.add_argument("--load_in_4bit", action="store_true")
     eval_parser.add_argument("--max_new_tokens", type=int, default=16)
+    eval_parser.add_argument("--output_csv", default=None)
+    eval_parser.add_argument("--shuffle_eval", action="store_true")
+    eval_parser.add_argument("--seed", type=int, default=42)
     eval_parser.set_defaults(func=eval_gt)
 
     return parser

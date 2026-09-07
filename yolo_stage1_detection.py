@@ -13,8 +13,8 @@ from PIL import Image
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-DEFAULT_TRAIN_JSON = "/home/dwd/桌面/Spinal-qwen-finetune/datasets/train_output/data_detcls_vl.json"
-DEFAULT_VAL_JSON = "/home/dwd/桌面/Spinal-qwen-finetune/datasets/val_output/data_detcls_vl.json"
+DEFAULT_TRAIN_JSON = "data/internal/train.json"
+DEFAULT_VAL_JSON = "data/internal/validation.json"
 
 
 @dataclass

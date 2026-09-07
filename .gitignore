@@ -1,37 +1,40 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-.ipynb_checkpoints/
-
-# IDE
-.idea/
-.vscode/
-
-# Data and experiment outputs
+# Patient data and derived image assets
+data/
 datasets/
-output/
-runs/
-wandb/
-swanlog/
-swanlab/
-nnUNet_raw/
+nnUNet_raw*/
 nnUNet_preprocessed/
 nnUNet_results/
 
-# Model checkpoints and weights
+# Models, adapters, checkpoints, and experiment outputs
+models/
+model/
+checkpoints/
+output/
+outputs/
+runs/
+swanlog/
 *.pt
 *.pth
-*.safetensors
-*.bin
 *.ckpt
+*.safetensors
+*.nii
+*.nii.gz
+*.npz
 
-# Logs and generated artifacts
-*.log
-*.tmp
-*.cache
-*.csv
+# Private metadata
+*PRIVATE*
+*private_mapping*
+*.dcm
+*.dicom
+.env
 
-# OS files
+# Python and editor files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db

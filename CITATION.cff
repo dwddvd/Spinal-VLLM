@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated manuscript."
+title: "Spinal-VLLM: Lesion-localized vision-language diagnosis for sagittal spine MRI"
+type: software
+version: 1.0.0
+date-released: 2026-09-07
+license: MIT
+repository-code: "https://github.com/dwddvd/Spinal-VLLM"
+authors:
+  - family-names: Du
+    given-names: Wending
+  - family-names: Kong
+    given-names: Dexing
+  - family-names: Zhu
+    given-names: Siyu
+  - family-names: Zheng
+    given-names: Jiali
+  - family-names: Chen
+    given-names: Bin
+  - family-names: Hong
+    given-names: Yuan
+    orcid: "https://orcid.org/0009-0000-0557-2938"
