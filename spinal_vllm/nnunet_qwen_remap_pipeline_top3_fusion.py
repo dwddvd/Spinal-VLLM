@@ -12,7 +12,7 @@ from peft import PeftModel
 from PIL import Image, ImageDraw
 from tqdm import tqdm
 
-from qwen_stage2_classifier import (
+from .qwen_stage2_classifier import (
     LesionRecord,
     build_messages,
     extract_image_path,

@@ -13,7 +13,7 @@ import random
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from aggregate_pipeline_predictions import (
+from spinal_vllm.aggregate_pipeline_predictions import (
     CLS_LABELS,
     aggregate_rows,
     candidate_quality,

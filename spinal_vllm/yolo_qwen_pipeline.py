@@ -12,7 +12,7 @@ from peft import PeftModel
 from PIL import Image
 from tqdm import tqdm
 
-from qwen_stage2_classifier import (
+from .qwen_stage2_classifier import (
     LesionRecord,
     build_messages,
     extract_image_path,
@@ -672,7 +672,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base_model", required=True)
     parser.add_argument("--adapter_path", required=True)
-    parser.add_argument("--pred_csv", required=True, help="YOLO top-k prediction CSV exported by yolo_stage1_detection.py predict.")
+    parser.add_argument(
+        "--pred_csv",
+        required=True,
+        help="YOLO top-k prediction CSV exported by preprocessing.yolo_stage1_detection predict.",
+    )
     parser.add_argument("--qwen_json", required=True, help="GT Qwen JSON with real bbox, used only for labels/evaluation.")
     parser.add_argument("--hidden_qwen_json", required=True, help="Hidden-bbox Qwen JSON used to construct inference prompts.")
     parser.add_argument("--output_dir", required=True)

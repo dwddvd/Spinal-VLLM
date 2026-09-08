@@ -5,7 +5,7 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from aggregate_pipeline_predictions import aggregate_rows, finish_metrics
+from spinal_vllm.aggregate_pipeline_predictions import aggregate_rows, finish_metrics
 
 
 CLS_LABELS = {"infection", "tumor"}

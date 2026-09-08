@@ -81,7 +81,7 @@ require_dir "${NNUNET_RAW}/labelsTs"
 require_dir "${NNUNET_PRED}"
 
 if [[ ! -f "${FOLD_DIR}/nested_protocol.json" ]]; then
-  python make_nested_adaptation_folds.py \
+  python -m experiments.make_nested_adaptation_folds \
     --qwen_json "${EXTERNAL_DIR}/data_vl_temporal_external.json" \
     --hidden_qwen_json "${EXTERNAL_DIR}/data_vl_temporal_external_hidden_bbox.json" \
     --output_dir "${FOLD_DIR}" \
@@ -101,7 +101,7 @@ run_pipeline_and_aggregate() {
 
   if [[ ! -f "${output_dir}/nnunet_qwen_remap_predictions.csv" ]]; then
     mkdir -p "${output_dir}"
-    python nnunet_qwen_remap_pipeline_top3_fusion.py \
+    python -m spinal_vllm.nnunet_qwen_remap_pipeline_top3_fusion \
       --base_model "${BASE_MODEL}" \
       --adapter_path "${adapter_path}" \
       --pred_dir "${NNUNET_PRED}" \
@@ -128,7 +128,7 @@ run_pipeline_and_aggregate() {
   fi
 
   if [[ ! -f "${output_dir}/aggregation/aggregation_metrics.json" ]]; then
-    python aggregate_pipeline_predictions.py \
+    python -m spinal_vllm.aggregate_pipeline_predictions \
       --pred_csv "${output_dir}/nnunet_qwen_remap_predictions.csv" \
       --output_dir "${output_dir}/aggregation" \
       --strategies quality_weighted_vote \
@@ -159,7 +159,7 @@ for FOLD in ${RUN_FOLDS}; do
     INNER_OUT="${FOLD_RESULT}/${CONFIG}/inner_selection"
 
     if [[ ! -f "${MIXED_DIR}/mixed_summary.json" ]]; then
-      python build_mixed_internal_external_train.py \
+      python -m experiments.build_mixed_internal_external_train \
         --internal_train_json "${INTERNAL_TRAIN}" \
         --internal_val_json "${INTERNAL_VAL}" \
         --external_adapt_train_json "${DATA_DIR}/${ADAPT_TAG}_train.json" \
@@ -175,7 +175,7 @@ for FOLD in ${RUN_FOLDS}; do
         TRAIN_RESUME_ARGS+=(--resume_from_checkpoint auto)
       fi
       TRAIN_CMD=(
-        python qwen_stage2_classifier.py train
+        python -m spinal_vllm.qwen_stage2_classifier train
         --base_model "${BASE_MODEL}"
         --train_json "${MIXED_DIR}/train_mixed.json"
         --val_json "${MIXED_DIR}/internal_val.json"
@@ -229,14 +229,14 @@ for FOLD in ${RUN_FOLDS}; do
   done
 
   if [[ ! -f "${FOLD_RESULT}/selection.json" ]]; then
-    python summarize_nested_adaptation_results.py select-fold \
+    python -m experiments.summarize_nested_adaptation_results select-fold \
       --fold "${FOLD}" \
       --adapt10_metrics "${FOLD_RESULT}/adapt10_r5/inner_selection/aggregation/aggregation_metrics.json" \
       --adapt20_metrics "${FOLD_RESULT}/adapt20_r3/inner_selection/aggregation/aggregation_metrics.json" \
       --output_json "${FOLD_RESULT}/selection.json"
   fi
 
-  SELECTED_CONFIG="$(python summarize_nested_adaptation_results.py get-selected --selection_json "${FOLD_RESULT}/selection.json")"
+  SELECTED_CONFIG="$(python -m experiments.summarize_nested_adaptation_results get-selected --selection_json "${FOLD_RESULT}/selection.json")"
   echo "[INFO] ${FOLD_NAME} selected ${SELECTED_CONFIG} before outer-test evaluation"
 
   run_pipeline_and_aggregate \
@@ -253,7 +253,7 @@ for FOLD in ${RUN_FOLDS}; do
 done
 
 if [[ "$(echo "${RUN_FOLDS}" | xargs)" == "0 1 2 3 4" ]]; then
-  python summarize_nested_adaptation_results.py summarize \
+  python -m experiments.summarize_nested_adaptation_results summarize \
     --protocol_json "${FOLD_DIR}/nested_protocol.json" \
     --results_root "${RESULTS_DIR}" \
     --output_dir "${RESULTS_DIR}/oof_summary" \
@@ -261,7 +261,7 @@ if [[ "$(echo "${RUN_FOLDS}" | xargs)" == "0 1 2 3 4" ]]; then
     --seed "${SEED}"
 else
   echo "[INFO] Partial RUN_FOLDS requested; skipping final OOF summary."
-  echo "[INFO] Run all folds or call summarize_nested_adaptation_results.py summarize after completion."
+  echo "[INFO] Run all folds or call experiments.summarize_nested_adaptation_results after completion."
 fi
 
 echo "========== Nested experiment complete =========="

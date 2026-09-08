@@ -13,7 +13,7 @@ FOLD_DIR="${FOLD_DIR:-${PROJECT_DIR}/datasets/temporal_external_v4_nested_select
 NESTED_RESULTS="${NESTED_RESULTS:-${PROJECT_DIR}/output/nested_adaptation_selection_v1}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_DIR}/output/yolo_qwen_nested_oof_fair_v1}"
 YOLO_WEIGHTS="${YOLO_WEIGHTS:-${PROJECT_DIR}/output/yolo_stage1_splitv1_rebuilt_legacyfmt/yolov8x_img1280_lesion/weights/best.pt}"
-YOLO_SCRIPT="${YOLO_SCRIPT:-${PROJECT_DIR}/yolo_stage1_detection.py}"
+YOLO_MODULE="${YOLO_MODULE:-preprocessing.yolo_stage1_detection}"
 SEED="${SEED:-42}"
 USE_4BIT="${USE_4BIT:-1}"
 RUN_FOLDS="${RUN_FOLDS:-0 1 2 3 4}"
@@ -24,8 +24,7 @@ for required in \
   "${EXTERNAL_DIR}/data_vl_temporal_external_hidden_bbox.json" \
   "${FOLD_DIR}/nested_protocol.json" \
   "${NESTED_RESULTS}/oof_summary/oof_selected_patient_predictions.csv" \
-  "${YOLO_WEIGHTS}" \
-  "${YOLO_SCRIPT}"; do
+  "${YOLO_WEIGHTS}"; do
   if [[ ! -e "${required}" ]]; then
     echo "[ERROR] Required path not found: ${required}" >&2
     exit 1
@@ -41,12 +40,12 @@ fi
 YOLO_SOURCE="${OUTPUT_ROOT}/external_yolo_inference_source"
 YOLO_PRED_CSV="${OUTPUT_ROOT}/external_yolo_top10_predictions.csv"
 if [[ ! -f "${YOLO_SOURCE}/inference_source_manifest.json" ]]; then
-  python prepare_yolo_inference_source_from_qwen_json.py \
+  python -m preprocessing.prepare_yolo_inference_source_from_qwen_json \
     --qwen_json "${EXTERNAL_DIR}/data_vl_temporal_external.json" \
     --output_dir "${YOLO_SOURCE}"
 fi
 if [[ ! -f "${YOLO_PRED_CSV}" ]]; then
-  python "${YOLO_SCRIPT}" predict \
+  python -m "${YOLO_MODULE}" predict \
     --weights "${YOLO_WEIGHTS}" \
     --source "${YOLO_SOURCE}" \
     --output_csv "${YOLO_PRED_CSV}" \
@@ -63,14 +62,14 @@ fi
 for FOLD in ${RUN_FOLDS}; do
   DATA_DIR="${FOLD_DIR}/fold_${FOLD}"
   FOLD_RESULT="${NESTED_RESULTS}/fold_${FOLD}"
-  SELECTED_CONFIG="$(python summarize_nested_adaptation_results.py get-selected --selection_json "${FOLD_RESULT}/selection.json")"
+  SELECTED_CONFIG="$(python -m experiments.summarize_nested_adaptation_results get-selected --selection_json "${FOLD_RESULT}/selection.json")"
   ADAPTER="${FOLD_RESULT}/${SELECTED_CONFIG}/adapter"
   RUN_DIR="${NESTED_RESULTS}/fold_${FOLD}/yolo_outer_test/${SELECTED_CONFIG}"
   mkdir -p "${RUN_DIR}"
   echo "========== fold_${FOLD}: ${SELECTED_CONFIG} =========="
 
   if [[ ! -f "${RUN_DIR}/yolo_qwen_final_selections.csv" ]]; then
-    python yolo_qwen_pipeline.py \
+    python -m spinal_vllm.yolo_qwen_pipeline \
       --base_model "${BASE_MODEL}" \
       --adapter_path "${ADAPTER}" \
       --pred_csv "${YOLO_PRED_CSV}" \
@@ -89,7 +88,7 @@ for FOLD in ${RUN_FOLDS}; do
   fi
 
   if [[ ! -f "${RUN_DIR}/yolo_slice_predictions_for_aggregation.csv" ]]; then
-    python prepare_yolo_predictions_for_aggregation.py \
+    python -m preprocessing.prepare_yolo_predictions_for_aggregation \
       --final_csv "${RUN_DIR}/yolo_qwen_final_selections.csv" \
       --output_csv "${RUN_DIR}/yolo_slice_predictions_for_aggregation.csv" \
       --top_k 3 \
@@ -97,7 +96,7 @@ for FOLD in ${RUN_FOLDS}; do
   fi
 
   if [[ ! -f "${RUN_DIR}/aggregation/aggregation_metrics.json" ]]; then
-    python aggregate_pipeline_predictions.py \
+    python -m spinal_vllm.aggregate_pipeline_predictions \
       --pred_csv "${RUN_DIR}/yolo_slice_predictions_for_aggregation.csv" \
       --output_dir "${RUN_DIR}/aggregation" \
       --strategies quality_weighted_vote \
@@ -106,7 +105,7 @@ for FOLD in ${RUN_FOLDS}; do
 done
 
 if [[ "$(echo "${RUN_FOLDS}" | xargs)" == "0 1 2 3 4" ]]; then
-  python summarize_yolo_nested_oof_comparison.py \
+  python -m experiments.summarize_yolo_nested_oof_comparison \
     --results_root "${NESTED_RESULTS}" \
     --reference_patient_csv "${NESTED_RESULTS}/oof_summary/oof_selected_patient_predictions.csv" \
     --output_dir "${OUTPUT_ROOT}/oof_summary" \

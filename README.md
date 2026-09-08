@@ -11,13 +11,13 @@ institution-specific filesystem paths.
 
 ## Workflow
 
-1. Create a patient-disjoint internal split with `make_split_v1.py`.
-2. Export lesion-positive 2D records with `export_qwen2d_from_npz_splitv1.py`.
-3. Prepare and train the 2D nnU-Net proposal model with `nnunet_stage1_prepare.py` and nnU-Net v2.
-4. Fine-tune the Qwen3.5-VL classifier with `qwen_stage2_classifier.py`.
+1. Create a patient-disjoint internal split with `preprocessing.make_split_v1`.
+2. Export lesion-positive 2D records with `preprocessing.export_qwen2d_from_npz_splitv1`.
+3. Prepare and train the 2D nnU-Net proposal model with `preprocessing.nnunet_stage1_prepare` and nnU-Net v2.
+4. Fine-tune the Qwen3.5-VL classifier with `spinal_vllm.qwen_stage2_classifier`.
 5. Run the leakage-controlled proposal-to-classification pipeline with
-   `nnunet_qwen_remap_pipeline_top3_fusion.py`.
-6. Aggregate slice evidence with `aggregate_pipeline_predictions.py`.
+   `spinal_vllm.nnunet_qwen_remap_pipeline_top3_fusion`.
+6. Aggregate slice evidence with `spinal_vllm.aggregate_pipeline_predictions`.
 7. Perform nested limited-sample temporal adaptation with
    `scripts/run_nested_adaptation_selection.sh`.
 8. Run the same-patient YOLO comparator with `scripts/run_yolo_qwen_nested_oof_fair.sh`.
@@ -60,15 +60,16 @@ selected only within the corresponding inner selection set; each patient receive
 prediction from a model and configuration that did not use that patient for adaptation or model
 selection.
 
-## Main analysis utilities
+## Repository layout
 
-- `summarize_nested_adaptation_results.py`: fold selection and complete out-of-fold summary.
-- `analyze_sequence_balanced_aggregation.py`: sequence-balanced sensitivity analysis.
-- `analyze_patient_score_calibration.py`: patient-level score calibration analysis.
-- `analyze_multilesion_candidate_subgroups.py`: multi-candidate/multilesion subgroup analysis.
-- `make_pipeline_strategy_ablation.py`: proposal and aggregation strategy ablations.
-- `summarize_yolo_nested_oof_comparison.py`: paired nnU-Net-versus-YOLO comparison.
-- `summarize_inference_benchmark.py`: inference timing and resource summary.
+- `spinal_vllm/`: the four core classification, proposal-fusion, and aggregation modules.
+- `preprocessing/`: only the data conversion and proposal-model utilities required by the reported workflow.
+- `experiments/`: nested selection, formal comparators, sensitivity analyses, and statistical summaries reported in the manuscript.
+- `scripts/`: three end-to-end commands for the primary experiment, YOLO comparison, and efficiency benchmark.
+
+Every retained Python file maps to a reported method, result, comparator, or sensitivity analysis.
+Historical fixed-adaptation scripts, exploratory all-slice evaluation, cohort bookkeeping, and
+release-only de-identification utilities are intentionally excluded.
 
 ## Data and checkpoints
 
@@ -77,10 +78,9 @@ Human MRI data and trained weights are not publicly distributed. See
 
 ## Reproducibility and safety
 
-Run `scripts/collect_reproducibility_environment.sh` to record the local environment. Before any
-public release, confirm that `git status` contains no data, model, output, private mapping, or
-absolute clinical path. The supplied `.gitignore` blocks the common sensitive artifacts used by
-this project.
+Before any derivative release, confirm that `git status` contains no data, model, output, private
+mapping, or absolute clinical path. The supplied `.gitignore` blocks the common sensitive
+artifacts used by this project.
 
 ## License
 

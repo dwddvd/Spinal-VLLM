@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use this software, please cite the associated manuscript."
 title: "Spinal-VLLM: Lesion-localized vision-language diagnosis for sagittal spine MRI"
 type: software
-version: 1.0.0
-date-released: 2026-09-07
+version: 1.0.1
+date-released: 2026-09-08
 license: MIT
 repository-code: "https://github.com/dwddvd/Spinal-VLLM"
 authors:

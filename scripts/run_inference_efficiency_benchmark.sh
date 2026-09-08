@@ -51,7 +51,7 @@ trap cleanup EXIT
 date +%s.%N > "${OUT_DIR}/start_epoch.txt"
 
 /usr/bin/time -v -o "${OUT_DIR}/time_verbose.txt" \
-  "${PYTHON_BIN}" nnunet_qwen_remap_pipeline_top3_fusion.py \
+  "${PYTHON_BIN}" -m spinal_vllm.nnunet_qwen_remap_pipeline_top3_fusion \
     --base_model "${BASE_MODEL}" \
     --adapter_path "${ADAPTER_PATH}" \
     --pred_dir "${PRED_DIR}" \
@@ -78,7 +78,7 @@ date +%s.%N > "${OUT_DIR}/end_epoch.txt"
 cleanup
 trap - EXIT
 
-"${PYTHON_BIN}" summarize_inference_benchmark.py \
+"${PYTHON_BIN}" -m experiments.summarize_inference_benchmark \
   --benchmark_dir "${OUT_DIR}" \
   --pipeline_metrics "${PIPELINE_OUT}/nnunet_qwen_remap_metrics.json" \
   --predictions_csv "${PIPELINE_OUT}/nnunet_qwen_remap_predictions.csv" \
